@@ -313,6 +313,7 @@ describe("FleetList rendering", () => {
     expect(agentLine).toContain(getDisplayName("general-purpose"));
     expect(agentLine).toContain("↓ 13.1k tokens");
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
+    expect(lines.at(-1)).toBe(`<borderMuted>${"─".repeat(120)}</borderMuted>`);
   });
 
   it("orders agents earliest-launched first (top)", () => {
@@ -351,7 +352,11 @@ describe("FleetList rendering", () => {
       makeRecord({ id: `a${i}`, description: `a very long agent description number ${i} that keeps going` }));
     const h = harness(agents);
     for (const w of [4, 8, 12, 20, 40, 80, 200]) {
-      for (const line of h.render(w)) {
+      const lines = h.render(w);
+      // The test theme's XML-like tags count as visible text to `visibleWidth`,
+      // unlike the real theme's ANSI escape sequences. The themed separator is
+      // asserted above; retain the wrap guard for actual content rows here.
+      for (const line of lines.slice(0, -1)) {
         expect(visibleWidth(line)).toBeLessThanOrEqual(w);
       }
     }

@@ -363,6 +363,9 @@ export class FleetList {
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
 
+    // FleetView renders immediately above Pi's footer/statusline. Keep the
+    // boundary visible without adding an interactive row to the roster.
+    lines.push(theme.fg("borderMuted", "─".repeat(width)));
     return lines;
   }
 

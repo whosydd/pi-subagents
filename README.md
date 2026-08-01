@@ -45,6 +45,16 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
+### Fork installation
+
+To install the maintained fork directly from GitHub:
+
+```bash
+pi install git:github.com/whosydd/pi-subagents
+```
+
+The fork's weekly upstream-sync workflow opens a pull request for each available upstream update; review and merge that pull request to adopt it.
+
 ## Quick Start
 
 The parent agent spawns sub-agents using the `Agent` tool:
