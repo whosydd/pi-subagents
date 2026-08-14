@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   sync:
@@ -17,46 +16,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Merge upstream changes
-        id: merge
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Merge upstream changes into master
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/tintinweb/pi-subagents.git
-          git fetch origin master sync-upstream || true
           git fetch upstream master
 
-          if git show-ref --verify --quiet refs/remotes/origin/sync-upstream; then
-            git switch --create sync-upstream --track origin/sync-upstream
-            git merge --no-edit origin/master
-          else
-            git switch --create sync-upstream origin/master
-          fi
-
           if git merge-base --is-ancestor upstream/master HEAD; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "master is already up to date with upstream/master"
             exit 0
           fi
 
+          echo "merging upstream/master ($(git rev-parse --short upstream/master)) into master"
           git merge --no-edit upstream/master
-          git push origin sync-upstream
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-
-      - name: Open or update sync pull request
-        if: steps.merge.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if gh pr list -R "${{ github.repository }}" --head sync-upstream --base master --state open --json number --jq 'length > 0' | grep -qx true; then
-            exit 0
-          fi
-          gh pr create \
-            -R "${{ github.repository }}" \
-            --base master \
-            --head sync-upstream \
-            --title "chore: sync upstream" \
-            --body "Automated sync from https://github.com/tintinweb/pi-subagents."
+          git push origin HEAD:master
+          echo "master synced with upstream/master"
