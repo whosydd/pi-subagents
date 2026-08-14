@@ -30,7 +30,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import {
@@ -278,14 +278,19 @@ export default function (pi: ExtensionAPI) {
     }
   );
 
+  // Read directly rather than waiting for applyAndEmitLoaded below: this decides
+  // the initial load, which happens hundreds of lines before settings are applied.
+  let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
+
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
-  const reloadCustomAgents = () => {
-    const userAgents = loadCustomAgents(process.cwd());
+  const reloadCustomAgents = (strict = false) => {
+    const userAgents = loadCustomAgents(process.cwd(), strict);
     registerAgents(userAgents);
   };
 
-  // Initial load
-  reloadCustomAgents();
+  // Initial load — the only strict one. A bad edit mid-session must not kill the
+  // session on the next unrelated spawn, so every later reload keeps warning.
+  reloadCustomAgents(strictAgentFiles);
 
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
@@ -755,6 +760,7 @@ export default function (pi: ExtensionAPI) {
       setDefaultJoinMode,
       setSchedulingEnabled,
       setScopeModels: setScopeModelsEnabled,
+      setStrictAgentFiles: (b) => { strictAgentFiles = b; },
       setDisableDefaultAgents: setDisableDefaultAgents,
       setToolDescriptionMode: setToolDescriptionMode,
       setFleetView: setFleetViewEnabled,
@@ -969,10 +975,13 @@ Terse command-style prompts produce shallow, generic work.
       return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, renderContext) {
       const details = result.details as AgentDetails | undefined;
-      if (!details) {
-        const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      // Pi reports pre-execution failures (extension block, abort, argument
+      // validation) as `{ content: [reason], details: {} }` with isError set —
+      // no status to render, so show the reason instead of inventing one (#199).
+      if (renderContext.isError || !details?.status) {
         return new Text(text, 0, 0);
       }
 
@@ -1034,6 +1043,12 @@ Terse command-style prompts produce shallow, generic work.
         let line = theme.fg("dim", "■") + (s ? " " + s : "");
         line += "\n" + theme.fg("dim", "  ⎿  Stopped");
         return new Text(line, 0, 0);
+      }
+
+      // Anything left ("queued", or a status added later) has no rendering of
+      // its own — the turn-limit wording below must not be the catch-all.
+      if (details.status !== "error" && details.status !== "aborted") {
+        return new Text(text, 0, 0);
       }
 
       // ---- Error / Aborted (hard max_turns) ----
@@ -1247,23 +1262,22 @@ Terse command-style prompts produce shallow, generic work.
           }
         };
 
-        try {
-          id = manager.spawn(pi, ctx, subagentType, params.prompt, {
-            description: params.description,
-            model,
-            maxTurns: effectiveMaxTurns,
-            isolated,
-            inheritContext,
-            thinkingLevel: thinking,
-            isBackground: true,
-            isolation,
-            invocation: agentInvocation,
-            rootSessionId: ctx.sessionManager.getSessionId(),
-            ...bgCallbacks,
-          });
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
-        }
+        // A throw here means the agent never started. Let it out: pi marks a
+        // tool call failed only when execute throws, and a returned message
+        // reads to the model as a subagent that ran and reported this (#179).
+        id = manager.spawn(pi, ctx, subagentType, params.prompt, {
+          description: params.description,
+          model,
+          maxTurns: effectiveMaxTurns,
+          isolated,
+          inheritContext,
+          thinkingLevel: thinking,
+          isBackground: true,
+          isolation,
+          invocation: agentInvocation,
+          rootSessionId: ctx.sessionManager.getSessionId(),
+          ...bgCallbacks,
+        });
 
         // Set output file + join mode synchronously after spawn, before the
         // event loop yields — onSessionCreated is async so this is safe.
@@ -1394,18 +1408,16 @@ Terse command-style prompts produce shallow, generic work.
           attachTranscript(fgRec, fgAgentId);
         });
         record = fgResult.record;
-      } catch (err) {
+      } finally {
+        // Runs on both paths, so a startup throw — which now propagates, see
+        // the background spawn above (#179) — no longer leaves the spinner
+        // ticking or a finished agent on the widget.
         clearInterval(spinnerInterval);
-        return textResult(err instanceof Error ? err.message : String(err));
-      }
-
-      clearInterval(spinnerInterval);
-
-      // Clean up foreground agent from widget
-      if (fgId) {
-        agentActivity.delete(fgId);
-        widget.markFinished(fgId);
-        fleet.onAgentFinished(fgId);
+        if (fgId) {
+          agentActivity.delete(fgId);
+          widget.markFinished(fgId);
+          fleet.onAgentFinished(fgId);
+        }
       }
 
       // Get final token count
@@ -2141,6 +2153,7 @@ ${systemPrompt}
       defaultJoinMode: getDefaultJoinMode(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
+      strictAgentFiles,
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
       fleetView: isFleetViewEnabled(),
@@ -2219,6 +2232,13 @@ ${systemPrompt}
           label: "Scope models",
           description: "Validate subagent models against scoped models (/scoped-models)",
           currentValue: isScopeModelsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "strictAgentFiles",
+          label: "Strict agent files",
+          description: "Fail startup on an unreadable/unparseable agent .md instead of skipping it with a warning",
+          currentValue: strictAgentFiles ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -2318,6 +2338,10 @@ ${systemPrompt}
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
         notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "strictAgentFiles") {
+        const enabled = value === "on";
+        strictAgentFiles = enabled;
+        notifyApplied(ctx, `Strict agent files ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
       } else if (id === "disableDefaultAgents") {
         const enabled = value === "on";
         setDisableDefaultAgents(enabled);
