@@ -33,6 +33,7 @@ Thumbs.db
 coverage/
 .gitnexus
 .pi/subagents.json
+.pi/tasks/
 
 # Pi internal files
 progress.md
