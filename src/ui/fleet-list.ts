@@ -12,10 +12,11 @@
  */
 
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, getDisplayName, type Theme } from "./agent-widget.js";
+import { type AgentActivity, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -374,10 +375,20 @@ export class FleetList {
   }
 
   private renderAgentRow(rosterIndex: number, sel: number, record: AgentRecord, width: number, theme: Theme): string {
-    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${theme.fg("muted", getDisplayName(record.type))}  ${record.description}`;
+    // The selected row renders in the theme's primary text color so it reads as
+    // one selection (#230). A configured badge survives — Claude Code's FleetView
+    // keeps the agent color on the selected row too and only bolds it — which also
+    // keeps the row's width fixed as the selection moves.
+    const selected = rosterIndex === sel;
+    const name = renderAgentName(record.type, theme, selected
+      ? { fallbackColor: "text", bold: hasAgentBadge(record.type) }
+      : { fallbackColor: "muted" });
+    const description = selected ? theme.fg("text", record.description) : record.description;
+    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}  ${description}`;
     const tokens = getLifetimeTotal(this.agentActivity.get(record.id)?.lifetimeUsage ?? record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
-    const right = theme.fg("dim", `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}`);
+    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}`;
+    const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }
 }

@@ -2,8 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { serializeAgentFile } from "../src/agent-file-toggle.js";
 import { BUILTIN_TOOL_NAMES } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import type { AgentConfig } from "../src/types.js";
 
 describe("loadCustomAgents", () => {
   let tmpDir: string;
@@ -149,6 +151,8 @@ Just a prompt.`);
     const agent = result.get("minimal")!;
 
     expect(agent.name).toBe("minimal");
+    expect(agent.displayName).toBeUndefined();
+    expect(agent.color).toBeUndefined();
     expect(agent.description).toBe("minimal"); // defaults to filename
     expect(agent.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES); // all tools
     expect(agent.extensions).toBe(true); // inherit all
@@ -580,16 +584,165 @@ enabled: false
     expect(agent.enabled).toBe(false);
   });
 
-  it("parses display_name frontmatter", () => {
+  it("takes the agent type from frontmatter name, not the filename", () => {
+    // Claude Code's rule: "the filename doesn't have to match". The same file
+    // dropped into either tool must dispatch under the same type.
+    writeAgent("blubb", `---
+name: code-review
+description: Reviews code
+---
+
+Agent prompt.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("code-review")!.name).toBe("code-review");
+    expect(result.get("blubb")).toBeUndefined();
+  });
+
+  it("records the file it was read from, not the one its type would name", () => {
+    // `/agents` edits `sourcePath`: probing for `<type>.md` finds nothing here,
+    // and its no-file branch writes a stub that loses to this file on load.
+    writeAgent("blubb", `---
+name: code-review
+description: Reviews code
+---
+
+Agent prompt.`);
+
+    expect(loadCustomAgents(tmpDir).get("code-review")!.sourcePath)
+      .toBe(join(tmpDir, ".pi", "agents", "blubb.md"));
+  });
+
+  it("falls back to the filename for an empty or blank declared name", () => {
+    // A quoted empty `name:` would otherwise register the agent under the empty
+    // type — unspawnable, and it takes the filename-derived one down with it.
+    writeAgent("myagent", "---\nname: \"\"\ndescription: My Agent\n---\n\nPrompt.");
+    writeAgent("other", "---\nname: \"   \"\ndescription: Other\n---\n\nPrompt.");
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("myagent")!.name).toBe("myagent");
+    expect(result.get("other")!.name).toBe("other");
+    expect(result.has("")).toBe(false);
+  });
+
+  it("trims a declared name so it matches what the user meant to type", () => {
+    writeAgent("blubb", "---\nname: \" code-review \"\ndescription: Reviews code\n---\n\nPrompt.");
+
+    expect(loadCustomAgents(tmpDir).get("code-review")!.name).toBe("code-review");
+  });
+
+  it("falls back to the filename when no name is declared", () => {
+    // Claude Code requires `name`; most existing files here predate it and
+    // must keep loading under the identity they already dispatch by.
     writeAgent("myagent", `---
+description: My Agent
+---
+
+Agent prompt.`);
+
+    expect(loadCustomAgents(tmpDir).get("myagent")!.name).toBe("myagent");
+  });
+
+  it("keeps display_name as a label only, independent of the type", () => {
+    writeAgent("blubb", `---
+name: code-review
 description: My Agent
 display_name: MyAgent
 ---
 
 Agent prompt.`);
 
+    const agent = loadCustomAgents(tmpDir).get("code-review")!;
+    expect(agent.name).toBe("code-review");
+    expect(agent.displayName).toBe("MyAgent");
+  });
+
+  it("leaves displayName unset so the badge falls back to the type", () => {
+    // A Claude Code file has no display_name; `getConfig` resolves the label
+    // to the type, so it still badges as "code-reviewer" as it did before.
+    writeAgent("whatever", `---
+name: code-reviewer
+description: Reviews code
+color: "#8B5CF6"
+---
+
+Agent prompt.`);
+
+    const agent = loadCustomAgents(tmpDir).get("code-reviewer")!;
+    expect(agent.name).toBe("code-reviewer");
+    expect(agent.displayName).toBeUndefined();
+    expect(agent.color).toBe("#8B5CF6");
+  });
+
+  it("accepts a name Claude Code accepts, however unlike a type it looks", () => {
+    // Its docs describe names as "lowercase letters and hyphens", but the only
+    // load failure they state is the colon — so this must still load.
+    writeAgent("reviewer", `---
+name: Code Reviewer
+description: Reviews code
+---
+
+Agent prompt.`);
+
+    expect(loadCustomAgents(tmpDir).get("Code Reviewer")!.name).toBe("Code Reviewer");
+  });
+
+  it("refuses a name containing the plugin-scope separator", () => {
+    // Claude Code doesn't load these. Skipping beats loading it under the
+    // filename, which would dispatch an agent whose declared identity nothing
+    // honoured.
+    writeAgent("scoped", `---
+name: my-plugin:reviewer
+description: Reviews code
+---
+
+Agent prompt.`);
+
     const result = loadCustomAgents(tmpDir);
-    expect(result.get("myagent")!.displayName).toBe("MyAgent");
+    expect(result.get("my-plugin:reviewer")).toBeUndefined();
+    expect(result.get("scoped")).toBeUndefined();
+  });
+
+  it("does not claim the rejected file was overriding its filename's agent", () => {
+    // It would have registered under its *declared* name, which a colon keeps
+    // out of the registry entirely — so it shadowed nothing. Reporting a
+    // substitution of the same-named file from another directory describes a
+    // swap that never happened, and points at an agent that is unchanged.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeWorkspaceAgent("scoped", "---\ndescription: An unrelated agent\n---\n\nBody.");
+      writeAgent("scoped", "---\nname: my-plugin:reviewer\ndescription: Reviews code\n---\n\nBody.");
+
+      const result = loadCustomAgents(tmpDir);
+
+      expect(result.get("scoped")?.description).toBe("An unrelated agent");
+      const message = warn.mock.calls.map(args => String(args[0])).join("\n");
+      expect(message).toContain("reserved for plugin-scoped identifiers");
+      expect(message).not.toContain("now loads from");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("lets a later file win a declared-name clash, as a filename clash always did", () => {
+    // Filenames were unique per directory by construction; declared names are
+    // not, so two files in one directory can now claim the same type.
+    writeAgent("a-first", `---
+name: shared
+description: first
+---
+
+First.`);
+    writeAgent("b-second", `---
+name: shared
+description: second
+---
+
+Second.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("shared")!.description).toBe("second");
+    expect([...result.keys()].filter(k => k === "shared")).toHaveLength(1);
   });
 
   it("parses disallowed_tools as csv list", () => {
@@ -693,6 +846,39 @@ Bad isolation.`);
 
     const result = loadCustomAgents(tmpDir);
     expect(result.get("bad-isolation")!.isolation).toBeUndefined();
+  });
+
+  // `isolation: off` is a veto, not a synonym for omitting the field: agent
+  // config outranks tool-call params, so it turns a caller's "worktree" back
+  // off. That is why it must survive parsing as "off" rather than undefined.
+  it("parses isolation: off", () => {
+    writeAgent("no-wt", `---
+description: Never worktree
+isolation: off
+---
+
+No worktree.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("no-wt")!.isolation).toBe("off");
+  });
+
+  // pi's frontmatter parser is not YAML 1.1, so bare `off`/`no` stay strings
+  // and only `false` becomes a boolean — accept the spellings an author is
+  // likely to reach for rather than silently dropping them.
+  it.each([
+    ["false", "isolation: false"],
+    ["none", "isolation: none"],
+    ["no", "isolation: no"],
+  ])("accepts %s as a spelling of off", (name, line) => {
+    writeAgent(`off-${name}`, `---
+${line}
+---
+
+Off.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get(`off-${name}`)!.isolation).toBe("off");
   });
 
   // A YAML error in one file used to escape loadFromDir and abort the whole
@@ -865,5 +1051,102 @@ Good body.`);
       else process.env.PI_CODING_AGENT_DIR = originalEnv;
       rmSync(altAgentDir, { recursive: true, force: true });
     }
+  });
+
+  // `/agents → Eject` writes an AgentConfig back out as frontmatter. That writer
+  // and this loader are the two halves of one format, but nothing pinned them
+  // together — so a field can serialize to something the loader reads back
+  // differently, and the agent silently changes shape on eject.
+  describe("eject round-trip", () => {
+    function roundTrip(cfg: Partial<AgentConfig>) {
+      const full: AgentConfig = {
+        description: "Round trip agent",
+        systemPrompt: "Body prompt.",
+        promptMode: "append",
+        ...cfg,
+      } as AgentConfig;
+      writeAgent("rt", serializeAgentFile(full));
+      const loaded = loadCustomAgents(tmpDir).get("rt");
+      expect(loaded).toBeDefined();
+      return loaded!;
+    }
+
+    it("preserves an explicitly narrowed tool list", () => {
+      expect(roundTrip({ builtinToolNames: ["read", "grep"] }).builtinToolNames).toEqual(["read", "grep"]);
+    });
+
+    it("preserves the full built-in set", () => {
+      expect(roundTrip({ builtinToolNames: [...BUILTIN_TOOL_NAMES] }).builtinToolNames)
+        .toEqual([...BUILTIN_TOOL_NAMES]);
+    });
+
+    it("preserves an empty tool list instead of widening it to every built-in", () => {
+      // `tools: none` parses to [] on load, so ejecting an agent with zero
+      // built-ins must not write `tools: all` — that hands it the whole toolbox.
+      expect(roundTrip({ builtinToolNames: [] }).builtinToolNames).toEqual([]);
+    });
+
+    it("preserves the scalar and list fields it writes", () => {
+      const loaded = roundTrip({
+        displayName: "RT",
+        model: "anthropic/claude-haiku-4-5",
+        thinking: "low",
+        maxTurns: 7,
+        allowedSubagents: ["Explore"],
+        excludeExtensions: ["ext-beta"],
+        disallowedTools: ["write"],
+        inheritContext: true,
+        runInBackground: true,
+        outputTranscript: false,
+        isolated: true,
+        memory: "project",
+        isolation: "worktree",
+      });
+      expect(loaded.displayName).toBe("RT");
+      expect(loaded.model).toBe("anthropic/claude-haiku-4-5");
+      expect(loaded.thinking).toBe("low");
+      expect(loaded.maxTurns).toBe(7);
+      expect(loaded.allowedSubagents).toEqual(["Explore"]);
+      expect(loaded.excludeExtensions).toEqual(["ext-beta"]);
+      expect(loaded.disallowedTools).toEqual(["write"]);
+      expect(loaded.inheritContext).toBe(true);
+      expect(loaded.runInBackground).toBe(true);
+      expect(loaded.outputTranscript).toBe(false);
+      expect(loaded.isolated).toBe(true);
+      expect(loaded.memory).toBe("project");
+      expect(loaded.isolation).toBe("worktree");
+    });
+
+    it("preserves the extension and skill list fields", () => {
+      // These serialize as bare CSV and are re-parsed by parseExtensionsSpec /
+      // the skills field. A generate/parse mismatch here is silent: the ejected
+      // agent loads fine but with a different extension or skill scope than the
+      // one that was ejected.
+      const loaded = roundTrip({
+        extensions: ["mcp", "pi-notify"],
+        skills: ["planning", "review"],
+        disallowedTools: ["write", "edit"],
+      });
+      expect(loaded.extensions).toEqual(["mcp", "pi-notify"]);
+      expect(loaded.skills).toEqual(["planning", "review"]);
+      expect(loaded.disallowedTools).toEqual(["write", "edit"]);
+    });
+
+    it("preserves the boolean forms of extensions and skills", () => {
+      const off = roundTrip({ extensions: false, skills: false });
+      expect(off.extensions).toBe(false);
+      expect(off.skills).toBe(false);
+    });
+
+    it("preserves allowed_subagents in both its list and `all` forms", () => {
+      expect(roundTrip({ allowedSubagents: "all" }).allowedSubagents).toBe("all");
+      expect(roundTrip({ allowedSubagents: ["Explore", "Plan"] }).allowedSubagents)
+        .toEqual(["Explore", "Plan"]);
+    });
+
+    it("preserves a description containing a colon", () => {
+      // Serialized via JSON.stringify precisely so YAML doesn't split on the colon.
+      expect(roundTrip({ description: "Scout: find things" }).description).toBe("Scout: find things");
+    });
   });
 });

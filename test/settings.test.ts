@@ -116,6 +116,34 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
+  it("round-trips agentMentions modes; drops an unknown one", () => {
+    for (const mode of ["model", "direct", "off"] as const) {
+      saveSettings({ agentMentions: mode }, projectDir);
+      expect(loadSettings(projectDir)).toEqual({ agentMentions: mode });
+    }
+    writeProject({ agentMentions: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({}); // unknown mode dropped
+  });
+
+  it("reads the pre-mode agentMentions booleans as their modes", () => {
+    // The setting shipped as a boolean before `model` existed, so a config
+    // written then — or hand-written from the old README — must keep working.
+    // `true` meant "on", and on is now `model`.
+    writeProject({ agentMentions: true } as any);
+    expect(loadSettings(projectDir)).toEqual({ agentMentions: "model" });
+    writeProject({ agentMentions: false } as any);
+    expect(loadSettings(projectDir)).toEqual({ agentMentions: "off" });
+  });
+
+  it("round-trips rememberAgents (true and false); keeps boolean, drops non-boolean", () => {
+    saveSettings({ rememberAgents: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ rememberAgents: false });
+    saveSettings({ rememberAgents: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ rememberAgents: true });
+    writeProject({ rememberAgents: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
+  });
+
   it("round-trips widgetMode; keeps valid values, drops invalid", () => {
     saveSettings({ widgetMode: "off" }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "off" });
@@ -131,6 +159,15 @@ describe("settings persistence", () => {
     saveSettings({ outputTranscript: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ outputTranscript: true });
     writeProject({ outputTranscript: "no" } as any);
+    expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
+  });
+
+  it("round-trips worktreeIsolation; drops non-boolean", () => {
+    saveSettings({ worktreeIsolation: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: false });
+    saveSettings({ worktreeIsolation: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: true });
+    writeProject({ worktreeIsolation: "off" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
@@ -431,8 +468,11 @@ describe("settings persistence", () => {
         setDisableDefaultAgents: vi.fn(),
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
+        setAgentMentions: vi.fn(),
+      setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
+        setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
       };
@@ -518,6 +558,20 @@ describe("settings persistence", () => {
       expect(appliers.setFleetView).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
+    it("applies agentMentions; skips it when absent", () => {
+      applySettings({ agentMentions: "direct" }, appliers);
+      expect(appliers.setAgentMentions).toHaveBeenCalledWith("direct");
+      applySettings({}, appliers);
+      expect(appliers.setAgentMentions).toHaveBeenCalledTimes(1); // absence is "use default"
+    });
+
+    it("applies rememberAgents; skips it when absent", () => {
+      applySettings({ rememberAgents: false }, appliers);
+      expect(appliers.setRememberAgents).toHaveBeenCalledWith(false);
+      applySettings({}, appliers);
+      expect(appliers.setRememberAgents).toHaveBeenCalledTimes(1); // absence is "use default"
+    });
+
     it("applies scopeModels: false", () => {
       applySettings({ scopeModels: false }, appliers);
       expect(appliers.setScopeModels).toHaveBeenCalledWith(false);
@@ -538,6 +592,13 @@ describe("settings persistence", () => {
       expect(appliers.setOutputTranscript).toHaveBeenCalledWith(false);
       applySettings({ outputTranscript: true }, appliers);
       expect(appliers.setOutputTranscript).toHaveBeenCalledWith(true);
+    });
+
+    it("applies worktreeIsolation (both true and false)", () => {
+      applySettings({ worktreeIsolation: false }, appliers);
+      expect(appliers.setWorktreeIsolation).toHaveBeenCalledWith(false);
+      applySettings({ worktreeIsolation: true }, appliers);
+      expect(appliers.setWorktreeIsolation).toHaveBeenCalledWith(true);
     });
 
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
@@ -598,8 +659,11 @@ describe("settings persistence", () => {
         setDisableDefaultAgents: vi.fn(),
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
+        setAgentMentions: vi.fn(),
+      setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setOutputTranscript: vi.fn(),
+        setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
       };

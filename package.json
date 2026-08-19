@@ -1,6 +1,6 @@
 {
   "name": "@tintinweb/pi-subagents",
-  "version": "0.15.1",
+  "version": "0.17.1",
   "description": "A pi extension extension that brings smart Claude Code-style autonomous sub-agents to pi.",
   "author": "tintinweb",
   "license": "MIT",
@@ -11,6 +11,9 @@
   "homepage": "https://github.com/tintinweb/pi-subagents#readme",
   "bugs": {
     "url": "https://github.com/tintinweb/pi-subagents/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "pi-package",
@@ -31,18 +34,23 @@
     "nanoid": "^5.0.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run e2e --reporter=verbose",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",
-    "lint:fix": "biome check --fix src/ test/"
+    "lint:fix": "biome check --fix src/ test/",
+    "test:coverage": "vitest run --coverage"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
     "@types/node": "^25.5.0",
+    "@vitest/coverage-istanbul": "^4.1.10",
     "typescript": "^6.0.0",
     "vitest": "^4.0.18"
   },

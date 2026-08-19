@@ -6,6 +6,7 @@
  */
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
+import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
@@ -305,9 +306,19 @@ export class AgentWidget {
     }
   }
 
+  /**
+   * Drop an agent's finished-age (call when a settled agent starts running
+   * again, i.e. a background resume). markFinished only seeds an age it has not
+   * seen before, so a resumed agent would otherwise keep the age from its
+   * previous run — already past the linger limit, hiding the new run's
+   * completion line entirely.
+   */
+  markRunning(agentId: string) {
+    this.finishedTurnAge.delete(agentId);
+  }
+
   /** Render a finished agent line. */
   private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string }, theme: Theme): string {
-    const name = getDisplayName(a.type);
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
 
@@ -339,7 +350,7 @@ export class AgentWidget {
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    return `${icon} ${renderAgentName(a.type, theme, { fallbackColor: "dim" })}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
   }
 
   /**
@@ -377,7 +388,6 @@ export class AgentWidget {
 
     const runningLines: string[][] = []; // each entry is [header, activity]
     for (const a of running) {
-      const name = getDisplayName(a.type);
       const modeLabel = getPromptModeLabel(a.type);
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
       const elapsed = formatMs(Date.now() - a.startedAt);
@@ -398,7 +408,7 @@ export class AgentWidget {
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }
@@ -440,6 +450,16 @@ export class AgentWidget {
       let hiddenRunning = 0;
       let hiddenFinished = 0;
 
+      // Reserve the queued line's row up front. It is a single summary of N
+      // waiting agents, so it cannot be folded into the "+N more" count (which
+      // is denominated in agents) without either under-reporting it as 1 or
+      // inflating the total with agents that were never getting their own rows.
+      // Reserving costs at most one running agent — which IS counted below —
+      // and makes the drop unreachable. It matters most exactly when it used to
+      // vanish: the pool is saturated and the queue is what the user needs to see.
+      const queuedReserve = queuedLine ? 1 : 0;
+      budget -= queuedReserve;
+
       // 1. Running agents (2 lines each)
       for (const pair of runningLines) {
         if (budget >= 2) {
@@ -450,8 +470,9 @@ export class AgentWidget {
         }
       }
 
-      // 2. Queued line
-      if (queuedLine && budget >= 1) {
+      // 2. Queued line (always fits — its row was reserved above)
+      if (queuedLine) {
+        budget += queuedReserve;
         lines.push(queuedLine);
         budget--;
       }

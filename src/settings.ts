@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
-import type { JoinMode, WidgetMode } from "./types.js";
+import type { AgentMentionMode, JoinMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
   maxConcurrent?: number;
@@ -86,6 +86,34 @@ export interface SubagentsSettings {
    */
   fleetView?: boolean;
   /**
+   * Whether `@handle message` typed at the prompt is routed to that subagent
+   * instead of the main model, and whether `@` offers running agents alongside
+   * pi's file completion. Defaults to `model`. Applied live.
+   *
+   *   - `model`: mentioning an agent that is not running asks the main model to
+   *     spawn it with the `Agent` tool, Claude Code's behaviour. Costs a turn,
+   *     and the model writes the agent's prompt rather than your text being it.
+   *   - `direct`: that agent is started here instead, with the typed message as
+   *     its prompt and no main-model turn spent.
+   *   - `off`: the input hook falls straight through and the stacked
+   *     autocomplete provider delegates everything back to pi's built-in one.
+   *
+   * Messaging a running agent and resuming a finished one are direct in both
+   * `model` and `direct`. The legacy booleans are still accepted: `true` reads
+   * as `model`, `false` as `off`.
+   */
+  agentMentions?: AgentMentionMode;
+  /**
+   * Whether subagents persist their pi session by default, so `@handle` can
+   * reopen an agent's conversation long after its in-memory record is gone.
+   * Defaults to `true`. Per-agent `persist_session:` frontmatter overrides it
+   * in both directions. Turning it off restores the previous behaviour, where
+   * a handle stops resolving roughly ten minutes after the agent finishes and
+   * mentioning it starts a fresh run instead. Persisted sessions also appear
+   * nested under the spawning session in pi's `/resume`.
+   */
+  rememberAgents?: boolean;
+  /**
    * Display mode for the persistent above-editor agent widget:
    *   - `all`: show every agent (foreground + background).
    *   - `background`: hide foreground agents — they already render inline as the
@@ -107,6 +135,29 @@ export interface SubagentsSettings {
    * (`isolation: worktree`), or memory files.
    */
   outputTranscript?: boolean;
+  /**
+   * Whether `isolation: "worktree"` may create a worktree at all. Defaults to
+   * `true`. Set `false` on a repo where worktrees are too slow or too large to
+   * be worth it (#184): a requested worktree is then dropped and the agent runs
+   * in the main checkout.
+   *
+   * The drop is deliberately silent — there is no per-result note, because the
+   * setting exists for projects whose model asks for a worktree on every call,
+   * where a note would be noise on every result. What keeps the orchestrator
+   * from claiming a `pi-agent-*` branch anyway is that it is never told the
+   * capability exists: `isolationParam` (invocation-config.ts) drops the field
+   * from both tool schemas, and `isolationGuideline` (index.ts) drops the
+   * matching prose from the full and compact descriptions — a custom one opts
+   * in via the `{{isolationGuideline}}` placeholder. Anything that
+   * reintroduces the prose has to reintroduce a note with it.
+   *
+   * Deliberately a downgrade rather than an error. The fail-loud rule covers
+   * worktrees that *cannot* be created; this is the user declining one, and
+   * throwing would reject exactly the calls that the `isolation: "off"` value
+   * exists to tolerate. Enforced below the tool boundary, so it also covers the
+   * scheduler and the unvalidated cross-extension RPC path.
+   */
+  worktreeIsolation?: boolean;
   /**
    * Hard ceiling on nested subagent delegation, counted from the main session:
    * main = 0, its subagents = 1, their children = 2. Defaults to `2`; `0` or `1`
@@ -145,8 +196,11 @@ export interface SettingsAppliers {
   setDisableDefaultAgents: (b: boolean) => void;
   setToolDescriptionMode: (mode: ToolDescriptionMode) => void;
   setFleetView: (b: boolean) => void;
+  setAgentMentions: (mode: AgentMentionMode) => void;
+  setRememberAgents: (b: boolean) => void;
   setWidgetMode: (mode: WidgetMode) => void;
   setOutputTranscript: (b: boolean) => void;
+  setWorktreeIsolation: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
 }
@@ -157,6 +211,7 @@ export type SettingsEmit = (event: string, payload: unknown) => void;
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set<JoinMode>(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptionMode>(["full", "compact", "custom"]);
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
+const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -220,11 +275,24 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.fleetView === "boolean") {
     out.fleetView = r.fleetView;
   }
+  // Was a boolean before the `model` mode existed. A hand-written or
+  // previously-written `true` means "on", which is now the default `model`.
+  if (typeof r.agentMentions === "boolean") {
+    out.agentMentions = r.agentMentions ? "model" : "off";
+  } else if (typeof r.agentMentions === "string" && VALID_AGENT_MENTION_MODES.has(r.agentMentions)) {
+    out.agentMentions = r.agentMentions as AgentMentionMode;
+  }
+  if (typeof r.rememberAgents === "boolean") {
+    out.rememberAgents = r.rememberAgents;
+  }
   if (typeof r.widgetMode === "string" && VALID_WIDGET_MODES.has(r.widgetMode)) {
     out.widgetMode = r.widgetMode as WidgetMode;
   }
   if (typeof r.outputTranscript === "boolean") {
     out.outputTranscript = r.outputTranscript;
+  }
+  if (typeof r.worktreeIsolation === "boolean") {
+    out.worktreeIsolation = r.worktreeIsolation;
   }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
@@ -298,8 +366,11 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.disableDefaultAgents === "boolean") appliers.setDisableDefaultAgents(s.disableDefaultAgents);
   if (s.toolDescriptionMode) appliers.setToolDescriptionMode(s.toolDescriptionMode);
   if (typeof s.fleetView === "boolean") appliers.setFleetView(s.fleetView);
+  if (s.agentMentions) appliers.setAgentMentions(s.agentMentions);
+  if (typeof s.rememberAgents === "boolean") appliers.setRememberAgents(s.rememberAgents);
   if (s.widgetMode) appliers.setWidgetMode(s.widgetMode);
   if (typeof s.outputTranscript === "boolean") appliers.setOutputTranscript(s.outputTranscript);
+  if (typeof s.worktreeIsolation === "boolean") appliers.setWorktreeIsolation(s.worktreeIsolation);
 }
 
 /**
