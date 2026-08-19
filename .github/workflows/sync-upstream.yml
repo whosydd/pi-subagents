@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   sync:
@@ -32,5 +31,18 @@ jobs:
 
           echo "merging upstream/master ($(git rev-parse --short upstream/master)) into master"
           git merge --no-edit upstream/master
+
+          # GITHUB_TOKEN cannot push changes under .github/workflows/, so restore the
+          # workflow files exactly as they are on origin/master. Upstream workflow
+          # updates are therefore excluded from the automatic sync and must be
+          # merged manually.
+          if ! git diff --quiet origin/master HEAD -- .github/workflows; then
+            echo "reverting upstream changes under .github/workflows (sync them manually)"
+            git diff --name-status origin/master HEAD -- .github/workflows
+            git rm -r --quiet --ignore-unmatch .github/workflows
+            git checkout origin/master -- .github/workflows
+            git commit --no-edit -m "sync: keep fork workflow files, exclude upstream workflow changes"
+          fi
+
           git push origin HEAD:master
           echo "master synced with upstream/master"
