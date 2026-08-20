@@ -10,7 +10,7 @@ import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
-import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
+import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
 
@@ -60,8 +60,6 @@ export interface AgentActivity {
   turnCount: number;
   /** Effective max turns for this agent (undefined = unlimited). */
   maxTurns?: number;
-  /** Lifetime usage breakdown — see LifetimeUsage docs. */
-  lifetimeUsage: LifetimeUsage;
 }
 
 /** Metadata attached to Agent tool results for custom rendering. */
@@ -85,6 +83,8 @@ export interface AgentDetails {
   turnCount?: number;
   /** Effective max turns (undefined = unlimited). */
   maxTurns?: number;
+  /** Estimated cost in USD; 0 when the model has no pricing data. */
+  cost?: number;
   agentId?: string;
   error?: string;
 }
@@ -103,6 +103,31 @@ export function formatTokens(count: number): string {
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M token`;
   if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k token`;
   return `${count} token`;
+}
+
+/**
+ * Format a cost as `~$0.0042`, or "" when there is nothing to show.
+ *
+ * The tilde is load-bearing: this is pi's own estimate from the model's listed
+ * rates, not a billed figure, and the surfaces that print it sit next to token
+ * counts that ARE exact.
+ *
+ * Nothing is printed for zero, which is also what a model with no pricing data
+ * reports: `$0.00` beside a local model's tokens would claim its cost was
+ * measured and found to be nothing, rather than never measured at all. For the
+ * same reason a real cost too small for four decimals reads `<$0.0001` — it was
+ * measured, and rounding it to `~$0.0000` would say the opposite.
+ */
+export function formatCost(cost: number): string {
+  if (!(cost > 0)) return "";                     // also catches NaN
+  if (cost < 0.0001) return "<$0.0001";
+  if (cost >= 1) return `~$${cost.toFixed(2)}`;
+  // Under a dollar: cents at minimum, four decimals at most, nothing trailing.
+  // Most single runs land between a tenth of a cent and a dime, where rounding
+  // to cents would collapse a 4x difference in spend into the same figure.
+  const rounded = Number(cost.toFixed(4));
+  const decimals = (String(rounded).split(".")[1] ?? "").length;
+  return `~$${rounded.toFixed(Math.max(2, decimals))}`;
 }
 
 /**
@@ -238,6 +263,12 @@ export class AgentWidget {
      * extension supplies one defaulting to `"background"`.
      */
     private mode: () => WidgetMode = () => "all",
+    /**
+     * Read live at render time, like `mode`. Whether running agents show an
+     * estimated cost beside their token count. Defaults to off — the extension
+     * supplies the user's `showCost` setting.
+     */
+    private showCost: () => boolean = () => false,
   ) {}
 
   /**
@@ -318,7 +349,7 @@ export class AgentWidget {
   }
 
   /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string }, theme: Theme): string {
+  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme): string {
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
 
@@ -347,6 +378,11 @@ export class AgentWidget {
     const activity = this.agentActivity.get(a.id);
     if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
     if (a.toolUses > 0) parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
+    // From the record, not the activity tracker: that entry is deleted the
+    // moment an agent finishes, and "what did it cost" is a question asked
+    // about finished agents.
+    const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
+    if (costText) parts.push(costText);
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
@@ -394,14 +430,20 @@ export class AgentWidget {
 
       const bg = this.agentActivity.get(a.id);
       const toolUses = bg?.toolUses ?? a.toolUses;
-      const tokens = getLifetimeTotal(bg?.lifetimeUsage);
+      // Spend comes from the record, never from the activity tracker: the record
+      // is the one that survives the agent finishing, and the one nested-tools
+      // folds a hidden child's spend into. Reading the tracker while an agent
+      // runs and the record once it stops made the figure jump at completion.
+      const tokens = getLifetimeTotal(a.lifetimeUsage);
       const contextPercent = getSessionContextPercent(bg?.session);
       const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
+      const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
 
       const parts: string[] = [];
       if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);
+      if (costText) parts.push(costText);
       parts.push(elapsed);
       const statsText = parts.join(" · ");
 

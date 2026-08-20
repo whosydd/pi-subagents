@@ -15,16 +15,35 @@ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
-import { addUsage } from "./usage.js";
+import { addUsage, type LifetimeUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
+/**
+ * Fired once per assistant `message_end`, for EVERY agent this manager owns —
+ * top-level and nested alike, spawns and resumes. The one place where each
+ * message is seen exactly once: `AgentRecord.lifetimeUsage` is deliberately
+ * double-booked into ancestors (see `nested-tools.ts`) so a hidden child's spend
+ * shows up on the record a human can see, which makes those records useless as
+ * a basis for anything that must not count a message twice — parent-session
+ * accounting above all.
+ */
+export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
 
-/** Default max concurrent background agents. */
-const DEFAULT_MAX_CONCURRENT = 4;
+/**
+ * Default max concurrent background agents.
+ *
+ * Raised from 4 when top-level spawns started defaulting to background
+ * (`backgroundByDefault`): foreground agents bypass this pool entirely, so
+ * while foreground was the default a fan-out of six ran six. With background
+ * as the default every top-level agent takes a slot, and a limit of 4 would
+ * have silently queued the tail of exactly the parallel fan-outs the `Agent`
+ * tool description tells the model to send.
+ */
+const DEFAULT_MAX_CONCURRENT = 10;
 
 /**
  * How many evicted agents stay addressable by name. Only a bound on memory —
@@ -180,12 +199,44 @@ interface ResumeOptions {
   onStarted?: () => void;
 }
 
+/** Best-effort ceiling on one child's shutdown handlers, so teardown can't strand a quit. */
+const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
+
+/**
+ * Close the extension lifecycle `runAgent` opened with `bindExtensions`, then dispose.
+ *
+ * `AgentSession.dispose()` only calls `ExtensionRunner.invalidate()` — pi emits the event
+ * itself in `AgentSessionRuntime.dispose()` beforehand, and this is the one place that binds
+ * extensions onto a session without going through that path. Without the emit, everything an
+ * extension armed in `session_start` leaks once per spawn, and its next tick throws
+ * `assertActive()` from a bare timer callback — an uncaughtException that kills pi (#242).
+ */
+async function shutdownChildSession(session: AgentSession | undefined): Promise<void> {
+  try {
+    const runner = session?.extensionRunner;
+    // Optional all the way down: on a pi without the getter, or a stubbed session from a
+    // partial `onSessionCreated`, skip the emit — the same degrade as before this fix.
+    if (runner?.hasHandlers?.("session_shutdown")) {
+      // Raced, not awaited outright. `emit` runs every handler serially with no timeout of
+      // its own, and dispose() is reached from pi's own `session_shutdown` with the TUI
+      // already torn down — one hung handler would leave a dead terminal.
+      await Promise.race([
+        runner.emit({ type: "session_shutdown", reason: "quit" }),
+        new Promise<void>(resolve => setTimeout(resolve, CHILD_SHUTDOWN_TIMEOUT_MS).unref()),
+      ]);
+    }
+  } catch { /* a partial session must degrade, not take the teardown down with it */ }
+  // Always, even on timeout: disposal is what this function ultimately exists to do.
+  try { session?.dispose?.(); } catch { /* ignore */ }
+}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
+  private onUsage?: OnAgentUsage;
   private maxConcurrent: number;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
@@ -209,10 +260,12 @@ export class AgentManager {
     maxConcurrent = DEFAULT_MAX_CONCURRENT,
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
+    onUsage?: OnAgentUsage,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
+    this.onUsage = onUsage;
     this.maxConcurrent = maxConcurrent;
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
@@ -268,7 +321,7 @@ export class AgentManager {
       toolUses: 0,
       startedAt: Date.now(),
       abortController,
-      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
       // Raw tri-state (not coerced to a boolean): true = background, false =
       // foreground (has an inline tool-result surface), undefined = caller never
@@ -389,6 +442,7 @@ export class AgentManager {
       onTextDelta: options.onTextDelta,
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
+        this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
@@ -657,6 +711,7 @@ export class AgentManager {
         },
         onAssistantUsage: (usage) => {
           addUsage(record.lifetimeUsage, usage);
+          this.onUsage?.(record, usage);
           options?.onAssistantUsage?.(usage);
         },
         onCompaction: (info) => {
@@ -747,6 +802,7 @@ export class AgentManager {
       },
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
+        this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
@@ -900,9 +956,15 @@ export class AgentManager {
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.tombstone(record);
-    record.session?.dispose?.();
+    const session = record.session;
+    // Detached before the shutdown starts, so the record leaves the map at once and
+    // nothing can observe a session that is half torn down.
     record.session = undefined;
     this.agents.delete(id);
+    // Fire-and-forget is right here and only here: this runs from the 60s cleanup timer
+    // and from `clearCompleted()` on session boundaries, with the process staying alive,
+    // so handlers get their full window. The quit path awaits instead — see dispose().
+    void shutdownChildSession(session);
   }
 
   /**
@@ -1007,14 +1069,16 @@ export class AgentManager {
     }
   }
 
-  dispose() {
+  async dispose(): Promise<void> {
     clearInterval(this.cleanupInterval);
     // Clear queue
     this.queue = [];
-    for (const record of this.agents.values()) {
-      record.session?.dispose();
-    }
+    const sessions = [...this.agents.values()].map(record => record.session);
     this.agents.clear();
+    // Awaited, unlike the eviction path: pi awaits this extension's `session_shutdown`
+    // handler and the process exits right after it returns, so anything left unawaited
+    // here never runs at all. Bounded — each call carries its own ceiling, concurrently.
+    await Promise.all(sessions.map(session => shutdownChildSession(session)));
     // Prune any orphaned git worktrees (crash recovery)
     try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
     // Also prune repos that caller-supplied cwds created worktrees in — a clean

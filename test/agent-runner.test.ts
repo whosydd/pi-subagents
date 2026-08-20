@@ -127,6 +127,7 @@ import {
   parseExtensionsSpec,
   parseExtSelectors,
   resolveDefaultModel,
+  resolveEffectiveMaxTurns,
   resumeAgent,
   runAgent,
   SUBAGENT_TOOL_NAMES,
@@ -525,11 +526,11 @@ describe("agent-runner usage callback wiring", () => {
     const { session, listeners } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
 
-    const seen: Array<{ input: number; output: number; cacheWrite: number }> = [];
+    const seen: Array<{ input: number; output: number; cacheWrite: number; cost?: number }> = [];
     session.prompt = vi.fn(async () => {
       // Two assistant messages over the run
-      emitMessageEnd(listeners, { input: 100, output: 50, cacheWrite: 10 });
-      emitMessageEnd(listeners, { input: 200, output: 80, cacheWrite: 20 });
+      emitMessageEnd(listeners, { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: { total: 0.002 } });
+      emitMessageEnd(listeners, { input: 200, output: 80, cacheWrite: 20, cacheRead: 1800, cost: { total: 0.004 } });
       session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
     });
 
@@ -538,9 +539,11 @@ describe("agent-runner usage callback wiring", () => {
       onAssistantUsage: (u) => seen.push(u),
     });
 
+    // cacheRead rides along even though the display total drops it (#38): the
+ // prefix is genuinely re-billed per call, and the parent-session report needs it.
     expect(seen).toEqual([
-      { input: 100, output: 50, cacheWrite: 10 },
-      { input: 200, output: 80, cacheWrite: 20 },
+      { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.002 },
+      { input: 200, output: 80, cacheWrite: 20, cacheRead: 1800, cost: 0.004 },
     ]);
   });
 
@@ -550,7 +553,7 @@ describe("agent-runner usage callback wiring", () => {
 
     const seen: any[] = [];
     session.prompt = vi.fn(async () => {
-      emitMessageEnd(listeners, { input: 50 }); // output, cacheWrite missing
+      emitMessageEnd(listeners, { input: 50 }); // output, cacheWrite, cacheRead, cost missing
       session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
     });
 
@@ -559,7 +562,9 @@ describe("agent-runner usage callback wiring", () => {
       onAssistantUsage: (u) => seen.push(u),
     });
 
-    expect(seen).toEqual([{ input: 50, output: 0, cacheWrite: 0 }]);
+    // An unpriced model reports no `cost` object at all — 0, never undefined,
+    // so accumulators never have to special-case it.
+    expect(seen).toEqual([{ input: 50, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 }]);
   });
 
   it("runAgent skips the callback when message_end has no usage field", async () => {
@@ -582,7 +587,7 @@ describe("agent-runner usage callback wiring", () => {
     const seen: any[] = [];
 
     session.prompt = vi.fn(async () => {
-      emitMessageEnd(listeners, { input: 10, output: 20, cacheWrite: 5 });
+      emitMessageEnd(listeners, { input: 10, output: 20, cacheWrite: 5, cacheRead: 90, cost: { total: 0.001 } });
       session.messages.push({ role: "assistant", content: [{ type: "text", text: "RESUMED" }] });
     });
 
@@ -590,7 +595,7 @@ describe("agent-runner usage callback wiring", () => {
       onAssistantUsage: (u) => seen.push(u),
     });
 
-    expect(seen).toEqual([{ input: 10, output: 20, cacheWrite: 5 }]);
+    expect(seen).toEqual([{ input: 10, output: 20, cacheWrite: 5, cacheRead: 90, cost: 0.001 }]);
   });
 
   it("forwards compaction_end events to onCompaction (only when not aborted)", async () => {
@@ -2219,6 +2224,53 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).toContain("read");
     expect(tools).toContain("foo_other");
     expect(tools).not.toContain("foo_tool"); // denylisted even though ext:foo selects it
+  });
+});
+
+// The limit a run will enforce, resolved before the run starts. The widget's
+// turn counter has to predict it for agents spawned outside the Agent tool
+// (mentions, cross-extension RPC), and a second copy of the expression there
+// would drift from the one runAgent enforces — so both call this.
+describe("resolveEffectiveMaxTurns", () => {
+  let prevDefault: number | undefined;
+
+  beforeEach(() => {
+    prevDefault = getDefaultMaxTurns();
+    vi.mocked(getAgentConfig).mockReturnValue(makeAgentConfig({ maxTurns: 7 }) as any);
+  });
+
+  afterEach(() => {
+    setDefaultMaxTurns(prevDefault);
+    vi.mocked(getAgentConfig).mockReset();
+  });
+
+  it("prefers an explicit value over the agent's own and the project default", () => {
+    setDefaultMaxTurns(20);
+    expect(resolveEffectiveMaxTurns("test-agent", 3)).toBe(3);
+  });
+
+  it("falls back to the agent's own max_turns", () => {
+    setDefaultMaxTurns(20);
+    expect(resolveEffectiveMaxTurns("test-agent")).toBe(7);
+  });
+
+  it("falls back to the project default when the agent sets none", () => {
+    setDefaultMaxTurns(20);
+    vi.mocked(getAgentConfig).mockReturnValue(makeAgentConfig() as any);
+    expect(resolveEffectiveMaxTurns("test-agent")).toBe(20);
+  });
+
+  it("is unlimited when nothing sets a limit", () => {
+    setDefaultMaxTurns(undefined);
+    vi.mocked(getAgentConfig).mockReturnValue(makeAgentConfig() as any);
+    expect(resolveEffectiveMaxTurns("test-agent")).toBeUndefined();
+  });
+
+  it("treats an explicit 0 as unlimited rather than as 'no opinion'", () => {
+    // Not the same as omitting it: 0 is how a caller says "no limit", and
+    // falling through to the default would impose one it asked not to have.
+    setDefaultMaxTurns(20);
+    expect(resolveEffectiveMaxTurns("test-agent", 0)).toBeUndefined();
   });
 });
 

@@ -19,7 +19,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -45,6 +45,7 @@ import {
   buildInvocationTags,
   describeActivity,
   fgPreservingNestedStyles,
+  formatCost,
   formatDuration,
   formatMs,
   formatTokens,
@@ -58,7 +59,7 @@ import {
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
-import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
+import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 
 // ---- Shared helpers ----
@@ -98,7 +99,6 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
     maxTurns,
     responseText: "",
     session: undefined,
-    lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
   };
 
   const callbacks = {
@@ -124,8 +124,9 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
     onSessionCreated: (session: any) => {
       state.session = session;
     },
-    onAssistantUsage: (usage: { input: number; output: number; cacheWrite: number }) => {
-      addUsage(state.lifetimeUsage, usage);
+    // Spend is accumulated on the AgentRecord (agent-manager), which is what
+    // every surface reads; this callback exists here only to repaint on it.
+    onAssistantUsage: (_usage: LifetimeUsage) => {
       onStreamUpdate?.();
     },
   };
@@ -159,13 +160,17 @@ function escapeXml(s: string): string {
 }
 
 /** Format a structured task notification matching Claude Code's <task-notification> XML. */
-function formatTaskNotification(record: AgentRecord, resultMaxLen: number): string {
+function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showCost = false): string {
   const status = getStatusLabel(record.status, record.error);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
   const contextPercent = getSessionContextPercent(record.session);
   const ctxXml = contextPercent !== null ? `<context_percent>${Math.round(contextPercent)}</context_percent>` : "";
   const compactXml = record.compactionCount ? `<compactions>${record.compactionCount}</compactions>` : "";
+  // Only under `showCost`: this is LLM context, and a figure the orchestrator
+  // did not ask for is a figure it may start reporting unprompted.
+  const cost = showCost ? getLifetimeCost(record.lifetimeUsage) : 0;
+  const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
 
   const resultPreview = record.result
     ? record.result.length > resultMaxLen
@@ -181,7 +186,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number): stri
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
-    `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}<duration_ms>${durationMs}</duration_ms></usage>`,
+    `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
 }
@@ -197,6 +202,10 @@ function buildDetails(
     ...base,
     toolUses: record.toolUses,
     tokens: formatLifetimeTokens(record),
+    // Raw, and unconditional: `tokens` is preformatted because it is one stat,
+    // but a cost is joined by "·" in one surface, "," in another and "|" in a
+    // third — so it travels as a number and each renderer punctuates its own.
+    cost: getLifetimeCost(record.lifetimeUsage),
     turnCount: activity?.turnCount,
     maxTurns: activity?.maxTurns,
     durationMs: (record.completedAt ?? Date.now()) - record.startedAt,
@@ -219,6 +228,10 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
     turnCount: activity?.turnCount ?? 0,
     maxTurns: activity?.maxTurns,
     totalTokens,
+    // Carried unconditionally; the renderer gates on the setting. Details are
+    // data, and a notification rendered before a mid-session toggle should not
+    // be stuck with the old answer.
+    totalCost: getLifetimeCost(record.lifetimeUsage),
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
     outputFile: record.outputFile,
     error: record.error,
@@ -295,6 +308,10 @@ export default function (pi: ExtensionAPI) {
         if (d.turnCount > 0) parts.push(formatTurns(d.turnCount, d.maxTurns));
         if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
         if (d.totalTokens > 0) parts.push(formatTokens(d.totalTokens));
+        if (showCost) {
+          const costText = formatCost(d.totalCost ?? 0);
+          if (costText) parts.push(costText);
+        }
         if (d.durationMs > 0) parts.push(formatMs(d.durationMs));
         if (parts.length) {
           line += "\n  " + parts.map(p => theme.fg("dim", p)).join(" " + theme.fg("dim", "·") + " ");
@@ -318,7 +335,19 @@ export default function (pi: ExtensionAPI) {
       }
 
       const all = [d, ...(d.others ?? [])];
-      return new Text(all.map(renderOne).join("\n"), 0, 0);
+      const rendered = all.map(renderOne);
+      // A group of agents lands as one notification, and the number a user wants
+      // from it is what the batch cost — not four figures to add up by hand.
+      // Derived from the per-agent details rather than carried alongside them:
+      // one source, so the total can never disagree with the rows above it.
+      if (showCost && all.length > 1) {
+        const total = formatCost(all.reduce((sum, a) => sum + (a.totalCost ?? 0), 0));
+        if (total) {
+          const tokens = all.reduce((sum, a) => sum + a.totalTokens, 0);
+          rendered.unshift(theme.fg("dim", `${all.length} agents · ${formatTokens(tokens)} · ${total}`));
+        }
+      }
+      return new Text(rendered.join("\n"), 0, 0);
     }
   );
 
@@ -338,6 +367,23 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
+
+  // ---- Usage reporting (both off by default; see SubagentsSettings) ----
+  /** Attach subagent spend to tool results, so the parent session counts it. */
+  let reportUsage = false;
+  function isReportUsageEnabled(): boolean { return reportUsage; }
+  function setReportUsage(b: boolean): void {
+    reportUsage = b;
+    // Whatever accumulated while it was on is stale the moment it goes off:
+    // draining it later would bill the parent for a window the user opted out
+    // of, in one lump, on some unrelated later tool call.
+    if (!b) pendingUsage.drain();
+  }
+  /** Show `~$X` next to token counts in the subagent surfaces. */
+  let showCost = false;
+  function isShowCostEnabled(): boolean { return showCost; }
+  function setShowCost(b: boolean): void { showCost = b; widget.update(); fleet.update(); }
+  const pendingUsage = new PendingUsagePool();
 
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
@@ -368,7 +414,7 @@ export default function (pi: ExtensionAPI) {
   function emitIndividualNudge(record: AgentRecord) {
     if (record.resultConsumed) return;  // re-check at send time
 
-    const notification = formatTaskNotification(record, 500);
+    const notification = formatTaskNotification(record, 500, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
 
     pi.sendMessage<NotificationDetails>({
@@ -398,7 +444,7 @@ export default function (pi: ExtensionAPI) {
         const unconsumed = records.filter(r => !r.resultConsumed);
         if (unconsumed.length === 0) { widget.update(); return; }
 
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300)).join('\n\n');
+        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
         const label = partial
           ? `${unconsumed.length} agent(s) finished (partial — others still running)`
           : `${unconsumed.length} agent(s) finished`;
@@ -433,6 +479,18 @@ export default function (pi: ExtensionAPI) {
     const tokens = total > 0
       ? { input: u.input, output: u.output, total }
       : undefined;
+    // The whole run's spend as a pi `Usage` — pi's convention for handing spend
+    // to a consumer, so `usage.cost.total` and `usage.cacheRead` are where a
+    // listener already expects them and anything pi adds to `Usage` arrives
+    // without a change here. Omitted when nothing was spent, so "spent nothing"
+    // and "never ran" stay distinguishable. Ungated by `showCost`: that setting
+    // governs what a human is shown, not what the event carries.
+    //
+    // `tokens` above is the other convention, kept as it shipped: a flat view
+    // model like pi's own `SessionStats`, carrying the DISPLAY total, which
+    // excludes cacheRead (#38). The two answer different questions and neither
+    // derives from the other.
+    const usage = toReportedUsage(u);
     return {
       id: record.id,
       type: record.type,
@@ -443,6 +501,7 @@ export default function (pi: ExtensionAPI) {
       toolUses: record.toolUses,
       durationMs,
       tokens,
+      usage,
     };
   }
 
@@ -518,6 +577,12 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
+  }, (_record, usage) => {
+    // Every assistant message from every agent — nested included, exactly once.
+    // Parked here until a tool result can carry it back to the parent session;
+    // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
+    // pool grows in a session that will never drain it.
+    if (reportUsage) pendingUsage.add(usage);
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -545,7 +610,27 @@ export default function (pi: ExtensionAPI) {
     reloadCustomAgents();
     const dispatch = resolveSpawnType(type);
     if (!dispatch.ok) throw new Error(dispatch.message);
-    return manager.spawn(piRef, ctxRef, dispatch.type, prompt, options);
+    // Every programmatic spawn lands here — cross-extension RPC, both `@handle`
+    // mention paths, and the `Symbol.for("pi-subagents:manager")` registry — and
+    // none came through the Agent tool, which is where the UI activity tracker is
+    // otherwise created. Without one the widget and FleetView have no tool name
+    // and no turn count, so the row reads `thinking…` for the agent's whole life
+    // while the header's tool-use count climbs beside it (#181). Double-tracking
+    // is not possible: the Agent tool calls `manager.spawn` directly. The tracker
+    // callbacks are the funnel's own — a caller's are not honoured, since a
+    // half-wired tracker renders worse than none.
+    //
+    // The turn limit is resolved rather than read off `options`, which a mention
+    // spawn deliberately omits so the agent's own config can decide: a tracker
+    // built with `undefined` renders `↻3` where the Agent tool renders `↻3≤20`.
+    // Like the tool's own, it is a prediction — editing the agent file mid-run
+    // leaves the displayed ceiling stale.
+    const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns));
+    // Repaints are left to the manager's `onStart` callback, which already starts
+    // the widget/fleet timers for agents that enter this way.
+    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...options, ...callbacks });
+    agentActivity.set(id, state);
+    return id;
   };
 
   const spawnTopLevel = (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
@@ -866,7 +951,7 @@ export default function (pi: ExtensionAPI) {
       // Not awaited: the clone runs a full model turn, and prompt() is blocked
       // until this hook returns. The user gets their prompt back immediately
       // and the agent appears in the widget when it starts.
-      void runMentionClone({ ctx, type, message: mention.message, agentTool })
+      void runMentionClone({ ctx, type, message: mention.message, agentTool: registeredAgentTool })
         .then((result) => {
           if (result.spawned) return;
           // A clone that could not run must not swallow the mention: start the
@@ -928,7 +1013,11 @@ export default function (pi: ExtensionAPI) {
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
-    manager.dispose();
+    // Awaited: it emits `session_shutdown` into every retained child session so
+    // extensions bound there can release what they armed in `session_start` (#242).
+    // pi awaits this handler, and the process exits right after — unawaited, those
+    // handlers would never run. Internally bounded, so a hung one can't strand quit.
+    await manager.dispose();
   });
 
   // Live widget: show running agents above editor.
@@ -938,11 +1027,11 @@ export default function (pi: ExtensionAPI) {
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode);
+  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  const fleet = new FleetList(manager, agentActivity);
+  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled);
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -968,6 +1057,13 @@ export default function (pi: ExtensionAPI) {
   let defaultJoinMode: JoinMode = 'smart';
   function getDefaultJoinMode(): JoinMode { return defaultJoinMode; }
   function setDefaultJoinMode(mode: JoinMode) { defaultJoinMode = mode; }
+
+  // What an unqualified top-level spawn means. Defaults to background,
+  // following Claude Code; `backgroundByDefault: false` restores the previous
+  // foreground default. Nested spawns ignore this — see nested-tools.ts.
+  let backgroundByDefault = true;
+  function getBackgroundByDefault(): boolean { return backgroundByDefault; }
+  function setBackgroundByDefault(b: boolean) { backgroundByDefault = b; }
 
   // Master switch for the schedule subagent feature. Defaults to enabled.
   // Read once at extension init (before tool registration) so the Agent tool's
@@ -1185,6 +1281,7 @@ export default function (pi: ExtensionAPI) {
       setDefaultMaxTurns,
       setGraceTurns,
       setDefaultJoinMode,
+      setBackgroundByDefault,
       setSchedulingEnabled,
       setScopeModels: setScopeModelsEnabled,
       setStrictAgentFiles: (b) => { strictAgentFiles = b; },
@@ -1198,6 +1295,8 @@ export default function (pi: ExtensionAPI) {
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
+      setReportUsage,
+      setShowCost,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -1251,7 +1350,8 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
-- Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
+- Parallel work: one message, multiple Agent calls — they run concurrently.
+- Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
@@ -1271,11 +1371,12 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 ## Usage notes
 
 - Always include a short (3-5 word) description summarizing what the agent will do (shown in UI).
-- When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
+- When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently. If the user specifies that they want you to run agents "in parallel", you MUST send a single message with multiple Agent tool use content blocks.
 - When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
-- Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
-- Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
+- Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting the work as done.
+- Agents run in the background by default. When an agent runs in the background, you will be automatically notified when it completes — do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
+- **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
+- **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
@@ -1286,7 +1387,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 
 ## Writing the prompt
 
-Provide clear, detailed prompts so the agent can work autonomously. Brief it like a smart colleague who just walked into the room — it hasn't seen this conversation, doesn't know what you've tried, doesn't understand why this task matters.
+Brief the agent like a smart colleague who just walked into the room — it hasn't seen this conversation, doesn't know what you've tried, doesn't understand why this task matters.
 - Explain what you're trying to accomplish and why.
 - Describe what you've already learned or ruled out.
 - Give enough context about the surrounding problem that the agent can make judgment calls rather than just following a narrow instruction.
@@ -1394,12 +1495,12 @@ Terse command-style prompts produce shallow, generic work.
       ),
       run_in_background: Type.Optional(
         Type.Boolean({
-          description: "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
+          description: "Defaults to true — the agent runs detached, returning its ID immediately, and you are notified on completion. Set false only when your very next action depends on the result; the call then blocks and returns the agent's full output inline.",
         }),
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context. Combine with run_in_background to resume detached and be notified on completion. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -1459,6 +1560,10 @@ Terse command-style prompts produce shallow, generic work.
         }
         if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
         if (d.tokens) parts.push(d.tokens);
+        if (showCost) {
+          const costText = formatCost(d.cost ?? 0);
+          if (costText) parts.push(costText);
+        }
         return parts.map(p => fgPreservingNestedStyles(theme, "dim", p)).join(" " + theme.fg("dim", "·") + " ");
       };
 
@@ -1570,6 +1675,7 @@ Terse command-style prompts produce shallow, generic work.
 
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params, {
         worktreeAllowed: isWorktreeIsolationEnabled(),
+        defaultRunInBackground: getBackgroundByDefault(),
       });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
@@ -1843,10 +1949,15 @@ Terse command-style prompts produce shallow, generic work.
       let fgId: string | undefined;
 
       const streamUpdate = () => {
+        // Spend from the record, everything else from the live tracker. `fgId`
+        // is set in onSessionCreated below, which fires before the first
+        // assistant message — so nothing is spent while this reads zero.
+        const fgRecord = fgId ? manager.getRecord(fgId) : undefined;
         const details: AgentDetails = {
           ...detailBase,
           toolUses: fgState.toolUses,
-          tokens: formatLifetimeTokens(fgState),
+          tokens: fgRecord ? formatLifetimeTokens(fgRecord) : "",
+          cost: fgRecord ? getLifetimeCost(fgRecord.lifetimeUsage) : 0,
           turnCount: fgState.turnCount,
           maxTurns: fgState.maxTurns,
           durationMs: Date.now() - startedAt,
@@ -1929,8 +2040,9 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Get final token count
-      const tokenText = formatLifetimeTokens(fgState);
+      // Get final token count — from the record, like the cost below it, so the
+      // two describe the same work when the agent delegated to nested children.
+      const tokenText = formatLifetimeTokens(record);
 
       const details = buildDetails(detailBase, record, fgState, { tokens: tokenText });
 
@@ -1942,6 +2054,10 @@ Terse command-style prompts produce shallow, generic work.
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
       const statsParts = [`${record.toolUses} tool uses`];
       if (tokenText) statsParts.push(tokenText);
+      if (showCost) {
+        const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
+        if (costText) statsParts.push(costText);
+      }
       return textResult(
         `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
         (record.result?.trim() || "No output."),
@@ -1949,15 +2065,47 @@ Terse command-style prompts produce shallow, generic work.
       );
     },
   });
-  pi.registerTool(agentTool);
+  /**
+   * Wrap a tool so its results carry back whatever subagent spend the parent
+   * session has not been told about yet (see `PendingUsagePool`).
+   *
+   * Pi copies `AgentToolResult.usage` onto the persisted tool-result message and
+   * folds it into `getSessionStats()`, which is what the footer, the statusline
+   * and `/cost` read — so this is the whole of "report usage to the parent".
+   *
+   * Nothing is attached to a call with no tool-call id. That is the `@handle`
+   * mention path (`mention-clone.ts`), which invokes this tool from a fork of the
+   * conversation that is discarded moments later: the result never becomes a
+   * message in the real session, so usage hung on it would be spend the user paid
+   * for and nobody counted. Skipping leaves it pending for the next real result.
+   */
+  function withUsageReporting<T extends { execute: (...args: any[]) => any }>(tool: T): T {
+    return {
+      ...tool,
+      execute: async (toolCallId: string | undefined, ...rest: any[]) => {
+        const result = await tool.execute(toolCallId, ...rest);
+        if (!reportUsage || !toolCallId) return result;
+        const usage = pendingUsage.drain();
+        return usage ? { ...result, usage } : result;
+      },
+    };
+  }
+  function registerToolReportingUsage(tool: any): void {
+    pi.registerTool(withUsageReporting(tool));
+  }
+
+  // The mention path is handed THIS object, not the bare `agentTool` — see the
+  // mention-clone header on why the clone must call the registered tool.
+  const registeredAgentTool = withUsageReporting(agentTool);
+  pi.registerTool(registeredAgentTool);
 
   // ---- get_subagent_result tool ----
 
-  pi.registerTool(defineTool({
+  registerToolReportingUsage(defineTool({
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve results from a background agent. Use the agent ID returned by Agent with run_in_background.",
+      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
@@ -2001,6 +2149,10 @@ Terse command-style prompts produce shallow, generic work.
       const contextPercent = getSessionContextPercent(record.session);
       const statsParts = [`Tool uses: ${record.toolUses}`];
       if (tokens) statsParts.push(tokens);
+      if (showCost) {
+        const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
+        if (costText) statsParts.push(`Cost: ${costText}`);
+      }
       if (contextPercent !== null) statsParts.push(`Context: ${Math.round(contextPercent)}%`);
       if (record.compactionCount) statsParts.push(`Compactions: ${record.compactionCount}`);
       statsParts.push(`Duration: ${duration}`);
@@ -2038,7 +2190,7 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- steer_subagent tool ----
 
-  pi.registerTool(defineTool({
+  registerToolReportingUsage(defineTool({
     name: SUBAGENT_TOOL_NAMES.STEER,
     label: "Steer Agent",
     description:
@@ -2076,6 +2228,10 @@ Terse command-style prompts produce shallow, generic work.
         const contextPercent = getSessionContextPercent(record.session);
         const stateParts: string[] = [];
         if (tokens) stateParts.push(tokens);
+        if (showCost) {
+          const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
+          if (costText) stateParts.push(costText);
+        }
         stateParts.push(`${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`);
         if (contextPercent !== null) stateParts.push(`context ${Math.round(contextPercent)}% full`);
         if (record.compactionCount) stateParts.push(`${record.compactionCount} compaction${record.compactionCount === 1 ? "" : "s"}`);
@@ -2279,7 +2435,7 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message));
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost);
       },
       {
         overlay: true,
@@ -2504,7 +2660,7 @@ extensions: <true (inherit all MCP/extension tools), false (none), or comma-sepa
 skills: <true (inherit all), false (none), or comma-separated skill names to preload into prompt. Default: true>
 disallowed_tools: <comma-separated tool names to block, even if otherwise available. Omit for none>
 inherit_context: <true to fork parent conversation into agent so it sees chat history. Default: false>
-run_in_background: <true to run in background by default. Default: false>
+run_in_background: <pin this agent to background (true) or foreground (false). Omit to follow the backgroundByDefault setting, which is background>
 output_transcript: <false to write no transcript file or path for this agent. Independent of persist_session. Default: true>
 isolated: <true for no extension/MCP tools, only built-in tools. Default: false>
 memory: <"user" (global), "project" (per-project), or "local" (gitignored per-project) for persistent memory. Omit for none>${
@@ -2644,6 +2800,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
       defaultJoinMode: getDefaultJoinMode(),
+      backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
       strictAgentFiles,
@@ -2661,6 +2818,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // explicit configuration — which then fails loudly if general-purpose later
       // goes away. undefined is dropped by JSON.stringify.
       fallbackSubagent: getFallbackSubagent(),
+      reportUsage: isReportUsageEnabled(),
+      showCost: isShowCostEnabled(),
     } satisfies SubagentsSettings;
   }
 
@@ -2728,6 +2887,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["smart", "async", "group"],
         },
         {
+          id: "backgroundByDefault",
+          label: "Background by default",
+          description: "An Agent call that doesn't say runs detached (off = blocks the turn and returns inline)",
+          currentValue: getBackgroundByDefault() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
           id: "schedulingEnabled",
           label: "Scheduling",
           description: "Schedule subagent feature (off removes `schedule` param from Agent tool spec on next pi session)",
@@ -2775,6 +2941,22 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description:
             "Allow isolation: worktree to copy the repo. Off refuses worktrees on every path immediately — for repos where a copy costs too much time or disk — and drops the `isolation` param from the Agent tool spec on next pi session.",
           currentValue: isWorktreeIsolationEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "reportUsage",
+          label: "Report usage to session",
+          description:
+            "Add subagent tokens and cost to this session's own totals, so pi's footer and /cost stop reading a delegating session as nearly free. Reported on the next tool result (agents that finish in the background are counted on the one after). Context-window % is unaffected.",
+          currentValue: isReportUsageEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "showCost",
+          label: "Show cost",
+          description:
+            "Show an estimated `~$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. Priced by pi from the model's rates — omitted entirely for a model it has no rates for.",
+          currentValue: isShowCostEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -2851,6 +3033,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);
         notifyApplied(ctx, `Default join mode set to ${value}`);
+      } else if (id === "backgroundByDefault") {
+        const enabled = value === "on";
+        setBackgroundByDefault(enabled);
+        notifyApplied(
+          ctx,
+          enabled
+            ? "Agent calls run in the background unless they pass run_in_background: false"
+            : "Agent calls block and return inline unless they pass run_in_background: true",
+        );
       } else if (id === "schedulingEnabled") {
         const enabled = value === "on";
         if (enabled === isSchedulingEnabled()) {
@@ -2899,6 +3090,19 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "toolDescriptionMode") {
         setToolDescriptionMode(value as ToolDescriptionMode);
         notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);
+      } else if (id === "reportUsage") {
+        const enabled = value === "on";
+        setReportUsage(enabled);
+        notifyApplied(
+          ctx,
+          enabled
+            ? "Subagent usage now counted in this session's totals"
+            : "Subagent usage no longer counted in this session's totals",
+        );
+      } else if (id === "showCost") {
+        const enabled = value === "on";
+        setShowCost(enabled);
+        notifyApplied(ctx, `Cost display ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);

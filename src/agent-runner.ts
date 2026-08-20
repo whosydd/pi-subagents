@@ -27,6 +27,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { LifetimeUsage } from "./usage.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -313,6 +314,19 @@ export function getDefaultMaxTurns(): number | undefined { return defaultMaxTurn
 export function setDefaultMaxTurns(n: number | undefined): void { defaultMaxTurns = normalizeMaxTurns(n); }
 
 /**
+ * The turn limit a run of `type` will actually enforce: an explicit value if the
+ * caller supplied one, else the agent's own `max_turns`, else the project
+ * default. `undefined` = unlimited.
+ *
+ * Exported because the widget's turn counter (`↻3≤20`) has to predict this
+ * before the run starts, and a second copy of the expression would drift from
+ * the one below that enforces it.
+ */
+export function resolveEffectiveMaxTurns(type: string, explicit?: number): number | undefined {
+  return normalizeMaxTurns(explicit ?? getAgentConfig(type)?.maxTurns ?? defaultMaxTurns);
+}
+
+/**
  * Project default for `persist_session`, from the `rememberAgents` setting.
  * On by default: a persisted session is what lets `@handle` reopen an agent's
  * conversation after its record has been evicted, which is the whole point of
@@ -432,8 +446,13 @@ export interface RunOptions {
    * Called once per assistant message_end with that message's usage delta.
    * Lets callers maintain a lifetime accumulator that survives compaction
    * (which replaces session.state.messages and resets stats-derived sums).
+   *
+   * `cost` is pi's own `usage.cost.total` for that message — priced from the
+   * model's rates, so it is 0 (not missing) for a model pi has no pricing for.
+   * We never price anything ourselves; every dollar figure this extension shows
+   * or reports traces back to this field.
    */
-  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  onAssistantUsage?: (usage: LifetimeUsage) => void;
   /**
    * Called when the session successfully compacts. `tokensBefore` is upstream's
    * pre-compaction context size estimate. Aborted compactions don't fire.
@@ -959,7 +978,7 @@ export async function runAgent(
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
-  const maxTurns = normalizeMaxTurns(options.maxTurns ?? agentConfig?.maxTurns ?? defaultMaxTurns);
+  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
   let softLimitReached = false;
   let aborted = false;
 
@@ -997,6 +1016,8 @@ export async function runAgent(
         input: u.input ?? 0,
         output: u.output ?? 0,
         cacheWrite: u.cacheWrite ?? 0,
+        cacheRead: u.cacheRead ?? 0,
+        cost: u.cost?.total ?? 0,
       });
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
@@ -1039,7 +1060,7 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
-    onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+    onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
@@ -1061,6 +1082,8 @@ export async function resumeAgent(
             input: u.input ?? 0,
             output: u.output ?? 0,
             cacheWrite: u.cacheWrite ?? 0,
+            cacheRead: u.cacheRead ?? 0,
+            cost: u.cost?.total ?? 0,
           });
         }
         if (event.type === "compaction_end" && !event.aborted && event.result) {
