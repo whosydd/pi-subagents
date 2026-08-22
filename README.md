@@ -56,7 +56,7 @@ To install the maintained fork directly from GitHub:
 pi install git:github.com/whosydd/pi-subagents
 ```
 
-The fork's weekly upstream-sync workflow opens a pull request for each available upstream update; review and merge that pull request to adopt it.
+The fork's upstream-sync workflow polls for upstream's latest published release and merges it into `master` when a new one appears. Commits that land on upstream `master` between releases are not synced.
 
 ## Quick Start
 

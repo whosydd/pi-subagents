@@ -16,21 +16,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Merge upstream changes into master
+      - name: Sync with latest upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/tintinweb/pi-subagents.git
-          git fetch upstream master
 
-          if git merge-base --is-ancestor upstream/master HEAD; then
-            echo "master is already up to date with upstream/master"
+          # Poll upstream for its latest published (non-prerelease, non-draft)
+          # release, and sync only when that release is newer than master.
+          latest="$(gh api repos/tintinweb/pi-subagents/releases/latest \
+            --jq '.tag_name' 2>/dev/null || true)"
+
+          if [ -z "$latest" ]; then
+            echo "no upstream release found"
             exit 0
           fi
 
-          echo "merging upstream/master ($(git rev-parse --short upstream/master)) into master"
-          git merge --no-edit upstream/master
+          echo "latest upstream release: $latest"
+          git fetch upstream "refs/tags/$latest:refs/tags/$latest"
+
+          if git merge-base --is-ancestor "$latest" HEAD; then
+            echo "master is already up to date with upstream release $latest"
+            exit 0
+          fi
+
+          echo "merging upstream release $latest ($(git rev-parse --short "$latest")) into master"
+          git merge --no-edit "$latest"
 
           # GITHUB_TOKEN cannot push changes under .github/workflows/, so restore the
           # workflow files exactly as they are on origin/master. Upstream workflow
@@ -45,4 +59,4 @@ jobs:
           fi
 
           git push origin HEAD:master
-          echo "master synced with upstream/master"
+          echo "master synced with upstream release $latest"
