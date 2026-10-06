@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describeModel, modelKey, resolveModelInput, routeCandidates } from "../extensions/lib/model.ts";
+import { describeModel, modelKey, resolveModelInput } from "../extensions/lib/model.ts";
 
 type Registry = ExtensionContext["modelRegistry"];
 
@@ -10,11 +10,12 @@ function fakeModel(provider: string, id: string, name?: string): Model<any> {
 	return { provider, id, name } as unknown as Model<any>;
 }
 
-function fakeRegistry(models: Model<any>[]): Registry {
+function fakeRegistry(models: Model<any>[], unauthenticated: string[] = []): Registry {
 	return {
 		find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
 		getAll: () => models,
 		getAvailable: () => models,
+		hasConfiguredAuth: (model: Model<any>) => !unauthenticated.includes(modelKey(model)),
 	} as unknown as Registry;
 }
 
@@ -22,6 +23,7 @@ const MODELS = [
 	fakeModel("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5"),
 	fakeModel("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5"),
 	fakeModel("google", "gemma-4-31b-it", "Gemma 4 31B"),
+	fakeModel("openrouter", "claude-haiku-4-5", "Claude Haiku 4.5"),
 ];
 
 test("resolveModelInput resolves an exact provider/modelId", () => {
@@ -30,16 +32,24 @@ test("resolveModelInput resolves an exact provider/modelId", () => {
 	assert.equal(modelKey(resolved as Model<any>), "anthropic/claude-sonnet-4-5");
 });
 
-test("resolveModelInput resolves a fuzzy display-name fragment", () => {
-	const resolved = resolveModelInput("haiku", fakeRegistry(MODELS));
+test("resolveModelInput resolves an unambiguous bare id", () => {
+	const resolved = resolveModelInput("gemma-4-31b-it", fakeRegistry(MODELS));
 	assert.notEqual(typeof resolved, "string");
-	assert.equal((resolved as Model<any>).id, "claude-haiku-4-5");
+	assert.equal(modelKey(resolved as Model<any>), "google/gemma-4-31b-it");
 });
 
-test("resolveModelInput normalizes dots and dashes in versions", () => {
-	const resolved = resolveModelInput("claude-haiku-4.5", fakeRegistry(MODELS));
-	assert.notEqual(typeof resolved, "string");
-	assert.equal((resolved as Model<any>).id, "claude-haiku-4-5");
+test("resolveModelInput refuses an id that several providers ship", () => {
+	const resolved = resolveModelInput("claude-haiku-4-5", fakeRegistry(MODELS));
+	assert.equal(typeof resolved, "string");
+	assert.match(resolved as string, /several providers/);
+	assert.match(resolved as string, /anthropic\/claude-haiku-4-5/);
+	assert.match(resolved as string, /openrouter\/claude-haiku-4-5/);
+});
+
+test("resolveModelInput reports a model without credentials", () => {
+	const resolved = resolveModelInput("anthropic/claude-haiku-4-5", fakeRegistry(MODELS, ["anthropic/claude-haiku-4-5"]));
+	assert.equal(typeof resolved, "string");
+	assert.match(resolved as string, /no configured credentials/);
 });
 
 test("resolveModelInput returns an error string listing available models", () => {
@@ -49,24 +59,18 @@ test("resolveModelInput returns an error string listing available models", () =>
 	assert.match(resolved as string, /anthropic\/claude-haiku-4-5/);
 });
 
+test("resolveModelInput rejects an empty spec", () => {
+	const resolved = resolveModelInput("   ", fakeRegistry(MODELS));
+	assert.equal(typeof resolved, "string");
+	assert.match(resolved as string, /empty/);
+});
+
 test("describeModel strips the Claude prefix and keeps the canonical id", () => {
 	const described = describeModel(fakeModel("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5"));
-	assert.deepEqual(described, { id: "anthropic/claude-sonnet-4-5", name: "sonnet 4.5" });
+	assert.deepEqual(described, { id: "anthropic/claude-sonnet-4-5", name: "Sonnet 4.5" });
 });
 
-test("routeCandidates always includes the parent model and honors the cap", () => {
-	const registry = fakeRegistry(MODELS);
-	const parent = MODELS[1];
-	const { candidates, warnings } = routeCandidates({ registry, parent, cap: 2 });
-	assert.deepEqual(warnings, []);
-	assert.equal(candidates.length, 2);
-	assert.ok(candidates.some((candidate) => candidate.key === "anthropic/claude-sonnet-4-5"));
-});
-
-test("routeCandidates warns about unresolvable explicit entries", () => {
-	const registry = fakeRegistry(MODELS);
-	const { candidates, warnings } = routeCandidates({ registry, spec: ["anthropic/claude-haiku-4-5", "nope/nope"], cap: 10 });
-	assert.equal(candidates.length, 1);
-	assert.equal(warnings.length, 1);
-	assert.match(warnings[0], /nope\/nope/);
+test("describeModel keeps the case of names it does not rewrite", () => {
+	assert.equal(describeModel(fakeModel("openai", "gpt-5", "GPT-5")).name, "GPT-5", "lowercasing would flatten a vendor's own casing");
+	assert.equal(describeModel(fakeModel("custom", "my-model")).name, "my-model", "a model with no display name falls back to its id");
 });
