@@ -127,6 +127,22 @@ const MAX_INLINE_RESULT_CHARS = 8_000;
 /** A notification should point at the full result, not carry it. */
 const MAX_NOTIFICATION_RESULT_CHARS = 800;
 
+/**
+ * How a completed background run reaches the parent conversation.
+ *
+ * `steer`, never `followUp`: steering is injected before the parent's next
+ * model request, so a parent still working folds the result into the answer it
+ * is writing. A follow-up waits until the parent would otherwise stop — by then
+ * the report is already out, and the notification lands as a stale extra turn.
+ *
+ * `triggerTurn` only matters when the parent is idle: it is what wakes the
+ * session up for a result that arrived after the last message.
+ */
+export const BACKGROUND_NOTIFICATION_DELIVERY = {
+	deliverAs: "steer",
+	triggerTurn: true,
+} as const;
+
 /** How much of a run's result a formatted message may carry. */
 export interface ResultFormatOptions {
 	/** Characters of the result to include. */
@@ -222,5 +238,8 @@ export function formatBackgroundNotification(record: AgentRecord, maxChars = MAX
 	if (record.error) lines.push("", `Error: ${record.error}`);
 	warningBlock(lines, record);
 	lines.push("", `Use get_subagent_result with agent_id "${record.id}" to read the full output.`);
+	// A detached spawn keeps the parent's turn running; a report written before
+	// this notification existed is not the final answer to the delegated task.
+	lines.push("If you already answered the delegated task, reconcile that answer with this result before finishing.");
 	return lines.join("\n");
 }

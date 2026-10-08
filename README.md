@@ -105,6 +105,11 @@ Environment variables, read once when the extension loads — reload pi to chang
 - **A spawn does not hold your turn.** The default is detached: you get an id,
   you keep working, and the result arrives as a notification. Ask for
   `run_in_background: false` only when the next step depends on the answer.
+- **A completion notification is a steering message, not a follow-up.** If the
+  parent is still mid-run, the notification is injected before its next model
+  request, so the result reaches the report being written instead of landing
+  after it. A parent that already stopped is woken with a fresh turn, and the
+  notification asks it to reconcile whatever it said earlier.
 - **The result is the agent's last substantive message**, not a transcript. Intermediate narration is dropped; there is no per-turn trace. Set `PI_SUBAGENTS_PERSIST=on` and open the child session file — its path is in the result — when you need the details.
 - **The header line names the model, why it was chosen, and the thinking level**: `Sub-agent completed: explore · Haiku 4.5 (agent "auditor" model) · thinking off · 3 turns · 4.2s`.
 - **Inline results are capped.** The full text stays in the record, and `get_subagent_result` returns up to `PI_SUBAGENTS_MAX_FULL_RESULT_CHARS` of it. Notifications carry a short excerpt and point at the id.

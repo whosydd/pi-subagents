@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AgentRegistry, claimUsageReport, formatBackgroundNotification, formatRunResult, mergeWarnings, newAgentRecord } from "../extensions/lib/registry.ts";
+import { AgentRegistry, BACKGROUND_NOTIFICATION_DELIVERY, claimUsageReport, formatBackgroundNotification, formatRunResult, mergeWarnings, newAgentRecord } from "../extensions/lib/registry.ts";
 import { EMPTY_USAGE, type AgentRecord } from "../extensions/lib/types.ts";
 
 function record(id: string, status: AgentRecord["status"], startedAt: number): AgentRecord {
@@ -157,4 +157,18 @@ test("formatBackgroundNotification points at the full result by id", () => {
 	assert.match(text, /Turns: 2/);
 	assert.match(text, /found it/);
 	assert.match(text, /agent_id "sa_7"/);
+});
+
+test("formatBackgroundNotification asks the parent to reconcile an earlier answer", () => {
+	// The notification is injected before the parent's next model request; a
+	// report the parent wrote earlier must not be left standing as final.
+	const finished: AgentRecord = { ...record("sa_8", "completed", Date.now()), completedAt: Date.now() + 1_000, result: "late" };
+	assert.match(formatBackgroundNotification(finished), /reconcile that answer with this result/);
+});
+
+test("a background notification steers rather than follows up", () => {
+	// `followUp` is only drained once the parent would stop, so the notification
+	// would always land after the report it was meant to inform. The delivery
+	// mode is the whole fix: keep it on `steer`.
+	assert.deepEqual(BACKGROUND_NOTIFICATION_DELIVERY, { deliverAs: "steer", triggerTurn: true });
 });

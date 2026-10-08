@@ -36,6 +36,7 @@ import { ConcurrencyLimiter } from "./lib/limiter.ts";
 import { describeModel, resolveModelInput } from "./lib/model.ts";
 import {
 	AgentRegistry,
+	BACKGROUND_NOTIFICATION_DELIVERY,
 	claimUsageReport,
 	formatBackgroundNotification,
 	formatRunResult,
@@ -61,6 +62,8 @@ const AGENT_TOOL_DESCRIPTION = `Launch a sub-agent that works autonomously on a 
 The sub-agent runs in its own session with its own context window: it sees the task you give it plus its agent instructions, not this conversation.
 
 By default the spawn is detached — this call returns an id and your turn continues; the sub-agent's final message arrives as a notification when it finishes. Pass run_in_background: false when you need the answer in this tool result before you can act on it.
+
+A task you delegated is not finished until its notification arrives: do not present delegated work as complete before then, and when the notification comes, fold the result into your answer (correcting anything you said earlier if needed).
 
 Agent types: "general" (all tools), "explore" (read-only: read/grep/find/ls), plus custom agents from the configured agent directories.
 
@@ -245,7 +248,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							display: true,
 							details: detailsFor(record),
 						},
-						{ deliverAs: "followUp", triggerTurn: true },
+						BACKGROUND_NOTIFICATION_DELIVERY,
 					);
 				}
 			} finally {
@@ -262,7 +265,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		promptSnippet: "Launch autonomous sub-agents for complex, multi-step tasks",
 		promptGuidelines: [
 			"Use Agent for broad exploration or work that would flood the main context window, and for independent tasks that can run in parallel. Use direct tools when the target is already known.",
-			"A spawn is detached by default. Keep working; the result arrives as a notification. Do not poll get_subagent_result for a running agent, and pass run_in_background: false only when you cannot continue without the answer.",
+			"A spawn is detached by default. Keep working; the result arrives as a notification. Do not poll get_subagent_result for a running agent, and pass run_in_background: false only when you cannot continue without the answer. A task you delegated is not done until its notification is folded into your answer.",
 			"Do not use Agent to batch tool calls, filter large outputs, or run a fixed pipeline — codemode does that in one script without a second model.",
 			"An agent's summary describes intent, not outcome — verify the actual changes before reporting work as done.",
 		],
@@ -336,7 +339,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (plan.background) {
 				startBackgroundRun(ctx, plan, params.prompt, record);
 				return textResult(
-					`Sub-agent "${record.id}" started in the background.\nType: ${plan.typeName}${record.modelName ? ` · Model: ${record.modelName}` : ""}\nKeep working; you will be notified when it finishes — do not poll. Pass run_in_background: false if you need the result before you can continue.${warningNote}`,
+					`Sub-agent "${record.id}" started in the background.\nType: ${plan.typeName}${record.modelName ? ` · Model: ${record.modelName}` : ""}\nKeep working; you will be notified when it finishes — do not poll, and do not report the task as finished until that notification arrives. Pass run_in_background: false if you need the result before you can continue.${warningNote}`,
 					detailsFor(record),
 				);
 			}
