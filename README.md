@@ -14,6 +14,7 @@ This package covers only what pi cannot do without a second agent loop:
   id.
 - **Agent types** — two built-ins (`general`, `explore`) plus markdown-defined agents from the user agent directory, and optionally from the project.
 - **Per-run control** — model, thinking level, turn limit, wall-clock timeout, built-in tool narrowing, `isolated` for a child without extension tools.
+- **Live activity panel** — a panel above the editor shows what each running agent does. A finished run keeps its `✓`/`✗` row for three seconds. `PI_SUBAGENTS_UI=off` hides the panel.
 
 It does **not** orchestrate tools. Bulk tool calls, parallel fan-out, output
 filtering, pipelines, and classifier calls belong to `codemode`; a sub-agent is
@@ -55,6 +56,25 @@ pin → the parent session's current level → pi's default.
 the candidates, and a model without credentials is rejected before the spawn —
 there is no fuzzy matching, because a silent near-match would pick a model the
 caller never asked for.
+
+### Activity panel
+
+While runs are in flight, a panel sits above the editor:
+
+```text
+ ✻ 2 subagents running
+   ⠹ explore · Map the TUI widget API · 3 turns · 12.0s
+   ⠸ general · Write the renderer · 1 turn · 4.0s
+```
+
+Each row spins while its run is live. The spinner follows `Date.now()`, so a
+queued run shows its wait. When a run ends, the row switches to `✓`. A failed
+run and an aborted run switch to `✗`. The row drops out after three seconds.
+The header counts running agents only, so it disappears with them.
+
+The panel appears in TUI sessions only. Print and json sessions never show it.
+An RPC client builds its own view from tool results and notifications. Set
+`PI_SUBAGENTS_UI=off` to hide the panel in TUI sessions too.
 
 ### Agent files
 
@@ -99,6 +119,7 @@ Environment variables, read once when the extension loads — reload pi to chang
 | `PI_SUBAGENTS_MAX_NOTIFICATION_CHARS` | `800` | Characters of a result a completion notification carries. |
 | `PI_SUBAGENTS_BACKGROUND_TIMEOUT_MS` | `1800000` | Wall-clock ceiling for detached runs. |
 | `PI_SUBAGENTS_MAX_PROMPT_CHARS` | `2000` | Prompt characters kept in a record. |
+| `PI_SUBAGENTS_UI` | `on` | `off` hides the live sub-agent activity panel above the editor. |
 
 ## Behaviour worth knowing
 

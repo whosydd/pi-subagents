@@ -14,6 +14,7 @@ test("readRuntimeSettings defaults preserve the previous behaviour", () => {
 	assert.equal(settings.maxNotificationChars, 800);
 	assert.equal(settings.backgroundTimeoutMs, 30 * 60_000, "background runs get a ceiling; nothing else would stop them");
 	assert.equal(settings.maxPromptChars, 2000);
+	assert.equal(settings.activityUi, true, "the live panel is on unless turned off");
 });
 
 test("readRuntimeSettings reads overrides and rejects nonsense", () => {
@@ -38,6 +39,12 @@ test("readRuntimeSettings reads overrides and rejects nonsense", () => {
 	assert.equal(nonsense.maxConcurrent, 4);
 	assert.equal(nonsense.maxRecords, 100);
 	assert.equal(nonsense.agentScope, "user");
+});
+
+test("readRuntimeSettings reads the activity panel toggle", () => {
+	assert.equal(readRuntimeSettings({ PI_SUBAGENTS_UI: "off" }).activityUi, false);
+	assert.equal(readRuntimeSettings({ PI_SUBAGENTS_UI: "on" }).activityUi, true);
+	assert.equal(readRuntimeSettings({ PI_SUBAGENTS_UI: "maybe" }).activityUi, true, "nonsense keeps the default");
 });
 
 test("readRuntimeSettings reads the project and both scopes", () => {

@@ -26,11 +26,13 @@
  *   PI_SUBAGENTS_MAX_NOTIFICATION_CHARS  background notification cap (default: 800)
  *   PI_SUBAGENTS_BACKGROUND_TIMEOUT_MS   background wall-clock ceiling (default: 1800000)
  *   PI_SUBAGENTS_MAX_PROMPT_CHARS        prompt characters kept in a record (default: 2000)
+ *   PI_SUBAGENTS_UI=off                  hide the live sub-agent activity panel
  */
 
 import type { Usage } from "@earendil-works/pi-ai";
 import { defineTool, getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { SubagentActivityView } from "./lib/activity.ts";
 import { invalidateAgents, loadAgents } from "./lib/agents.ts";
 import { ConcurrencyLimiter } from "./lib/limiter.ts";
 import { describeModel, resolveModelInput } from "./lib/model.ts";
@@ -56,6 +58,9 @@ import {
 	type ResultToolDetails,
 	type UsageTotals,
 } from "./lib/types.ts";
+
+/** Widget key for the live sub-agent activity panel. */
+const ACTIVITY_WIDGET_KEY = "subagents-activity";
 
 const AGENT_TOOL_DESCRIPTION = `Launch a sub-agent that works autonomously on a task and reports back.
 
@@ -125,6 +130,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	/** Abort controllers for in-flight background spawns. */
 	const background = new Set<AbortController>();
 	let shuttingDown = false;
+	/** Live activity panel. It stays undefined until a run gives it something to show. */
+	let activity: SubagentActivityView | undefined;
 
 	// Agent files are cached to keep spawns off the filesystem; a reload is when
 	// the user says they edited one.
@@ -136,7 +143,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		shuttingDown = true;
 		for (const controller of background) controller.abort();
 		background.clear();
+		// The panel's timer must die with the session, and the next session
+		// builds a fresh view rather than calling into a disposed one.
+		activity?.dispose();
+		activity = undefined;
 	});
+
+	/**
+	 * Mirror the registry into the activity panel.
+	 *
+	 * TUI only: a component factory has no meaning in print or json mode, and an
+	 * RPC client drives its own display from tool results and notifications.
+	 */
+	function refreshActivity(ctx: ExtensionContext): void {
+		// A run aborted by session shutdown still reaches finishRecord. The panel
+		// must not be remounted into a UI that is already gone.
+		if (shuttingDown || !runtime.activityUi || ctx.mode !== "tui" || !ctx.hasUI) return;
+		activity ??= new SubagentActivityView({
+			getRecords: () => registry.all(),
+			mount: (factory) => ctx.ui.setWidget(ACTIVITY_WIDGET_KEY, factory, { placement: "aboveEditor" }),
+			unmount: () => ctx.ui.setWidget(ACTIVITY_WIDGET_KEY, undefined),
+			getTheme: () => ctx.ui.theme,
+		});
+		activity.refresh();
+	}
 
 	/**
 	 * How much of a result each reader may carry. The inline cap is smaller, and
@@ -149,7 +179,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 	const fullFormat: ResultFormatOptions = { maxChars: runtime.maxFullResultChars, fullOutputAvailable: false };
 
-	function finishRecord(record: AgentRecord, outcome: RunOutcome): void {
+	function finishRecord(ctx: ExtensionContext, record: AgentRecord, outcome: RunOutcome): void {
 		record.completedAt = Date.now();
 		record.turns = outcome.turns;
 		record.usage = outcome.usage;
@@ -162,6 +192,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		record.warnings = mergeWarnings(record.warnings, outcome.warnings);
 		record.sessionFile = outcome.sessionFile;
 		record.status = outcome.aborted ? "aborted" : outcome.error ? "failed" : "completed";
+		refreshActivity(ctx);
 	}
 
 	function detailsFor(record: AgentRecord): AgentToolDetails {
@@ -225,7 +256,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					await limiter.acquire(controller.signal);
 					acquired = true;
 				} catch {
-					finishRecord(record, abortedOutcome("parent"));
+					finishRecord(ctx, record, abortedOutcome("parent"));
 					return;
 				}
 				let outcome: RunOutcome;
@@ -233,12 +264,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					outcome = await runAgent(
 						buildRunOptions(ctx, plan, prompt, controller.signal, (turn) => {
 							record.turns = turn;
+							refreshActivity(ctx);
 						}),
 					);
 				} catch (error) {
 					outcome = failureOutcome(error, controller.signal.aborted ? "parent" : undefined);
 				}
-				finishRecord(record, outcome);
+				finishRecord(ctx, record, outcome);
 				// A notification after shutdown has nowhere to go.
 				if (!shuttingDown) {
 					pi.sendMessage<AgentToolDetails>(
@@ -332,6 +364,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			// the only places the parent sees them.
 			if (warnings.length > 0) record.warnings = [...warnings];
 			registry.add(record);
+			refreshActivity(ctx);
 
 			const warningNote =
 				warnings.length > 0 ? `\n\nAgent file warnings:\n${warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
@@ -347,18 +380,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			try {
 				await limiter.acquire(signal);
 			} catch {
-				finishRecord(record, abortedOutcome("parent"));
+				finishRecord(ctx, record, abortedOutcome("parent"));
 				return textResult(formatRunResult(record, inlineFormat), detailsFor(record));
 			}
 			let outcome: RunOutcome;
 			try {
-				outcome = await runAgent(buildRunOptions(ctx, plan, params.prompt, signal));
+				outcome = await runAgent(
+					buildRunOptions(ctx, plan, params.prompt, signal, (turn) => {
+						record.turns = turn;
+						refreshActivity(ctx);
+					}),
+				);
 			} catch (error) {
 				outcome = failureOutcome(error, signal?.aborted === true ? "parent" : undefined);
 			} finally {
 				limiter.release();
 			}
-			finishRecord(record, outcome);
+			finishRecord(ctx, record, outcome);
 			// This result carries the usage; a later read must not count it twice.
 			record.usageReported = true;
 			// formatRunResult renders the record's warnings (agent-file ones

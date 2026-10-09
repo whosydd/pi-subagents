@@ -38,6 +38,8 @@ export interface RuntimeSettings {
 	backgroundTimeoutMs: number;
 	/** Prompt characters kept in the record; the rest is dropped. */
 	maxPromptChars: number;
+	/** Live sub-agent activity panel above the editor (TUI sessions only). */
+	activityUi: boolean;
 }
 
 const DEFAULT_MAX_CONCURRENT = 4;
@@ -84,5 +86,6 @@ export function readRuntimeSettings(env: NodeJS.ProcessEnv = process.env): Runti
 		maxNotificationChars: readLimit(env, "PI_SUBAGENTS_MAX_NOTIFICATION_CHARS", DEFAULT_MAX_NOTIFICATION_CHARS),
 		backgroundTimeoutMs: readLimit(env, "PI_SUBAGENTS_BACKGROUND_TIMEOUT_MS", DEFAULT_BACKGROUND_TIMEOUT_MS),
 		maxPromptChars: readLimit(env, "PI_SUBAGENTS_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS),
+		activityUi: parseToggle(env.PI_SUBAGENTS_UI, true),
 	};
 }
